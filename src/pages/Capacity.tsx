@@ -51,14 +51,16 @@ type CapTab = 'overview' | 'namespaces' | 'nodes' | 'rightsizing';
 type PredictTarget = {
   namespace: string;
   resource: 'cpu' | 'memory';
-  node?: string;
-  container?: string;
 };
 
 const FORECAST_RESOURCE_OPTIONS = [
   { label: 'CPU', value: 'cpu' as const },
   { label: 'Memory', value: 'memory' as const },
 ];
+
+function recIdentity(r: WorkloadRecommendation): string {
+  return `${r.namespace}\0${r.workloadKind}\0${r.workloadName}\0${r.container}\0${r.environment ?? ''}`;
+}
 
 function pct(ratio: number): string {
   if (!Number.isFinite(ratio) || ratio <= 0) {
@@ -124,7 +126,7 @@ function Capacity() {
   const styles = useStyles2(getStyles);
   const appNavigate = useAppNavigate();
   const updateParams = useUrlParams();
-  const { fromMs, toMs, refresh } = useTimeRange();
+  const { from, to, fromMs, toMs, refresh } = useTimeRange();
   const [searchParams] = useSearchParams();
   const env = sanitizeParam(searchParams.get('environment') ?? '');
   const nsFilter = sanitizeParam(searchParams.get('namespace') ?? '');
@@ -133,6 +135,7 @@ function Capacity() {
   const [selectedRecKey, setSelectedRecKey] = useState<string | null>(null);
   const [predict, setPredict] = useState<PredictTarget | null>(null);
 
+  // Always load overview so ns/env Combobox options work on a direct rightsizing landing.
   const {
     data: overview,
     loading: overviewLoading,
@@ -140,8 +143,7 @@ function Capacity() {
     refetch: refetchOverview,
   } = useFetch<CapacityOverview>(
     () => getCapacity(fromMs, toMs, { namespace: nsFilter || undefined, environment: env || undefined }),
-    [fromMs, toMs, nsFilter, env],
-    { skip: tab === 'rightsizing' }
+    [fromMs, toMs, nsFilter, env]
   );
 
   const {
@@ -163,22 +165,23 @@ function Capacity() {
   const {
     data: history,
     loading: historyLoading,
+    stale: historyStale,
     error: historyError,
     refetch: refetchHistory,
   } = useFetch<CapacityHistoryResponse>(
     () =>
       getCapacityHistory(fromMs, toMs, {
         namespace: predictNs,
-        container: predict?.container,
         environment: env || undefined,
       }),
-    [fromMs, toMs, predictNs, predict?.container, env],
+    [fromMs, toMs, predictNs, env],
     { skip: !predict || !predictNs }
   );
 
   const {
     data: forecast,
     loading: forecastLoading,
+    stale: forecastStale,
     error: forecastError,
     refetch: refetchFc,
   } = useFetch<CapacityForecastResponse>(
@@ -186,10 +189,9 @@ function Capacity() {
       getCapacityForecast(fromMs, toMs, {
         resource: predict?.resource ?? 'cpu',
         namespace: predictNs,
-        container: predict?.container,
         environment: env || undefined,
       }),
-    [fromMs, toMs, predictNs, predict?.resource, predict?.container, env],
+    [fromMs, toMs, predictNs, predict?.resource, env],
     { skip: !predict || !predictNs || toMs - fromMs < 2 * 60 * 60 * 1000 }
   );
 
@@ -237,14 +239,11 @@ function Capacity() {
   const topWasteCpu: CapacityContainerRow[] = useMemo(() => overview?.topWasteCpu ?? [], [overview?.topWasteCpu]);
   const recommendations: WorkloadRecommendation[] = useMemo(() => recs?.recommendations ?? [], [recs?.recommendations]);
 
-  const recIdentity = (r: WorkloadRecommendation) =>
-    `${r.namespace}\0${r.workloadKind}\0${r.workloadName}\0${r.container}\0${r.environment ?? ''}`;
-
-  // Clear selection when recommendation request scope changes; resolve open
-  // drawer against the latest response so yamlPatch is never stale.
+  // Clear on filter or deliberate range URL change. Refresh of relative ranges
+  // keeps the same from/to params while only fromMs/toMs move, so selection stays.
   useEffect(() => {
     setSelectedRecKey(null);
-  }, [fromMs, toMs, nsFilter, env]);
+  }, [from, to, nsFilter, env]);
 
   const selectedRec = useMemo(() => {
     if (!selectedRecKey) {
@@ -685,7 +684,7 @@ function Capacity() {
                         <InteractiveTable
                           columns={nodeColumns}
                           data={nodes}
-                          getRowId={(r) => r.node}
+                          getRowId={(r) => `${r.environment ?? ''}\0${r.node}`}
                           renderExpandedRow={(n) => (
                             <Box padding={1.5} backgroundColor="canvas" borderRadius="default">
                               <Stack
@@ -712,34 +711,6 @@ function Capacity() {
                                       Pods: {n.podCount}
                                     </Text>
                                   )}
-                                </Stack>
-                                <Stack direction="row" gap={1}>
-                                  <Button
-                                    size="sm"
-                                    variant="secondary"
-                                    onClick={() =>
-                                      setPredict({
-                                        namespace: nsFilter || filteredNamespaces[0]?.namespace || 'default',
-                                        resource: 'cpu',
-                                        node: n.node,
-                                      })
-                                    }
-                                  >
-                                    Predict CPU Usage
-                                  </Button>
-                                  <Button
-                                    size="sm"
-                                    variant="secondary"
-                                    onClick={() =>
-                                      setPredict({
-                                        namespace: nsFilter || filteredNamespaces[0]?.namespace || 'default',
-                                        resource: 'memory',
-                                        node: n.node,
-                                      })
-                                    }
-                                  >
-                                    Predict Mem Usage
-                                  </Button>
                                 </Stack>
                               </Stack>
                             </Box>
@@ -774,7 +745,7 @@ function Capacity() {
                 <InteractiveTable
                   columns={recColumns}
                   data={recommendations}
-                  getRowId={(r) => `${r.namespace}-${r.workloadName}-${r.container}`}
+                  getRowId={(r) => recIdentity(r)}
                   pageSize={15}
                 />
               </Box>
@@ -813,7 +784,7 @@ function Capacity() {
 
         {predict && (
           <Drawer
-            title={`Predict ${predict.resource.toUpperCase()} · ${predict.namespace}${predict.node ? ` · ${predict.node}` : ''}`}
+            title={`Predict ${predict.resource.toUpperCase()} · ${predict.namespace}`}
             onClose={() => setPredict(null)}
             size="lg"
           >
@@ -845,12 +816,9 @@ function Capacity() {
                 </Alert>
               ) : (
                 <DataState
-                  loading={historyLoading || forecastLoading}
+                  loading={historyLoading || forecastLoading || historyStale || forecastStale}
                   error={historyError || forecastError}
-                  empty={
-                    (history != null && !history.available && forecast != null && !forecast.available) ||
-                    (forecast != null && !forecast.available && !forecastLoading)
-                  }
+                  empty={history != null && !history.available && forecast != null && !forecast.available}
                   emptyTitle="No predict data"
                   emptyMessage={forecast?.enablementNote || history?.enablementNote}
                   skeleton={<TableSkeleton rows={4} />}

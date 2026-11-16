@@ -133,12 +133,16 @@ func resourcesYAMLPatchSelective(cpuReq float64, includeCPU bool, cpuLim *float6
 	if includeMem {
 		fmt.Fprintf(&b, "    memory: %q\n", formatMemoryBytes(memReq))
 	}
-	b.WriteString("  limits:\n")
-	if includeCPU && cpuLim != nil {
-		fmt.Fprintf(&b, "    cpu: %q\n", formatCPUCores(*cpuLim))
-	}
-	if includeMem {
-		fmt.Fprintf(&b, "    memory: %q\n", formatMemoryBytes(memLim))
+	writeCPULim := includeCPU && cpuLim != nil
+	writeMemLim := includeMem
+	if writeCPULim || writeMemLim {
+		b.WriteString("  limits:\n")
+		if writeCPULim {
+			fmt.Fprintf(&b, "    cpu: %q\n", formatCPUCores(*cpuLim))
+		}
+		if writeMemLim {
+			fmt.Fprintf(&b, "    memory: %q\n", formatMemoryBytes(memLim))
+		}
 	}
 	return b.String()
 }

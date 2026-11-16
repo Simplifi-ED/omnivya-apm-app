@@ -212,6 +212,9 @@ func TestCapacityNodeAllocSQL_GroupsByCluster(t *testing.T) {
 	if !strings.Contains(sql, "GROUP BY resource, node, k8s_cluster_name") {
 		t.Fatalf("missing cluster group: %s", sql)
 	}
+	if strings.Contains(sql, "LIMIT 500") {
+		t.Fatal("node alloc population must not cap at LIMIT 500")
+	}
 }
 
 func TestParseCapacityLedgerRows_AndResultMap(t *testing.T) {
@@ -285,13 +288,16 @@ func TestLinearForecast(t *testing.T) {
 
 func TestCapacityNodeFsSQLAndMerge(t *testing.T) {
 	sql := CapacityNodeFsSQL("prod", time.Now().Add(-time.Hour), time.Now())
-	for _, want := range []string{MetricContainerFSUsage, MetricContainerFSLimit, "usage_bytes", "limit_bytes"} {
+	for _, want := range []string{MetricContainerFSUsage, MetricContainerFSLimit, "usage_bytes", "limit_bytes", "GROUP BY node, k8s_cluster_name"} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("fs SQL missing %q\n%s", want, sql)
 		}
 	}
 	if strings.Contains(sql, "kube_node_status_capacity") {
 		t.Fatal("must not invent usage from capacity-only KSM")
+	}
+	if strings.Contains(sql, "LIMIT 500") {
+		t.Fatal("node fs population must not cap at LIMIT 500")
 	}
 	rm := emptyCapacityResultMap()
 	MergeNodeFsIntoResultMap(rm, []map[string]any{

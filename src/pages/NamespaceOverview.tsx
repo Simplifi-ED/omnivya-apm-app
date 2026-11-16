@@ -150,6 +150,7 @@ function NamespaceOverview() {
     refetchAlerts();
     if (isRelativeRange) {
       refreshTimeRange();
+      setCapacityRefreshKey((n) => n + 1);
       return;
     }
     refetchServices();

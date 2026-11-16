@@ -53,7 +53,6 @@ export function NamespaceCapacityBlock({
   }
 
   const gaps = data.gapCounts;
-  const ns = data.namespaces.find((n) => n.namespace === namespace) ?? data.namespaces[0];
 
   return (
     <section className={styles.section} aria-label="Capacity">
@@ -75,9 +74,7 @@ export function NamespaceCapacityBlock({
       </div>
       <div className={styles.tiles}>
         <div className={styles.tile}>
-          <div className={styles.value}>
-            {formatUsd(ns?.reclaimableMonthlyUsd ?? data.efficiency.reclaimableMonthlyUsd)}
-          </div>
+          <div className={styles.value}>{formatUsd(data.efficiency.reclaimableMonthlyUsd)}</div>
           <div className={styles.label}>Reclaimable / mo</div>
         </div>
         <div className={styles.tile}>

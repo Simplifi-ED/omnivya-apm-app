@@ -465,13 +465,14 @@ func (a *App) queryCapacityProm(ctx context.Context, namespace, env string, at t
 		{"nsMemUsage", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, memUsage)},
 		{"nsCpuReq", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, cpuReq)},
 		{"nsMemReq", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, memReq)},
-		{"nodeCpuUsage", fmt.Sprintf(`sum by (node, kubernetes_io_hostname, instance) (%s)`, cpuUsage)},
-		{"nodeMemUsage", fmt.Sprintf(`sum by (node, kubernetes_io_hostname, instance) (%s)`, memUsage)},
+		// Raw per-node usage: capacityCPUUsageExpr aggregates away node labels.
+		{"nodeCpuUsage", capacityNodeCPUUsageExpr(ctr, scope)},
+		{"nodeMemUsage", capacityNodeMemUsageExpr(ctr, scope)},
 		{"nodeCpuAlloc", capacityNodeAllocByNode(ctr.NodeAllocatable, ctr.ResourceLabel, "cpu", a.otelCfg.Labels.DeploymentEnv, env)},
 		{"nodeMemAlloc", capacityNodeAllocByNode(ctr.NodeAllocatable, ctr.ResourceLabel, "memory", a.otelCfg.Labels.DeploymentEnv, env)},
 		// Root-cgroup fs (container=""); soft-null in UI when series absent — never invent from KSM capacity alone.
-		{"nodeFsUsage", `sum by (node, kubernetes_io_hostname, instance) (container_fs_usage_bytes{container="",id="/"})`},
-		{"nodeFsLimit", `sum by (node, kubernetes_io_hostname, instance) (container_fs_limit_bytes{container="",id="/"})`},
+		{"nodeFsUsage", capacityNodeFsExpr("container_fs_usage_bytes", a.otelCfg.Labels.DeploymentEnv, env)},
+		{"nodeFsLimit", capacityNodeFsExpr("container_fs_limit_bytes", a.otelCfg.Labels.DeploymentEnv, env)},
 	}
 
 	resultMap := a.runInstantQueries(ctx, at, jobs, logger)
@@ -661,9 +662,16 @@ func capacityNodeName(m map[string]string) string {
 	return ""
 }
 
+func capacityNodeKey(cluster, node string) string {
+	if cluster == "" {
+		return node
+	}
+	return cluster + "\x00" + node
+}
+
 func buildCapacityNodes(resultMap map[string][]queries.PromResult) []CapacityNodeRollup {
 	type agg struct {
-		env                                        string
+		name, env                                  string
 		cpuUsage, memUsage                         float64
 		cpuAlloc, memAlloc                         float64
 		fsUsage, fsLimit                           float64
@@ -671,10 +679,11 @@ func buildCapacityNodes(resultMap map[string][]queries.PromResult) []CapacityNod
 	}
 	byNode := map[string]*agg{}
 	ensure := func(name, env string) *agg {
-		a := byNode[name]
+		k := capacityNodeKey(env, name)
+		a := byNode[k]
 		if a == nil {
-			a = &agg{env: env}
-			byNode[name] = a
+			a = &agg{name: name, env: env}
+			byNode[k] = a
 		} else if a.env == "" && env != "" {
 			a.env = env
 		}
@@ -723,9 +732,9 @@ func buildCapacityNodes(resultMap map[string][]queries.PromResult) []CapacityNod
 		}
 	}
 	out := make([]CapacityNodeRollup, 0, len(byNode))
-	for name, a := range byNode {
+	for _, a := range byNode {
 		row := CapacityNodeRollup{
-			Node: name, Environment: a.env,
+			Node: a.name, Environment: a.env,
 			CPUUsage: roundTo(a.cpuUsage, 4), MemUsage: roundTo(a.memUsage, 0),
 			CPUAlloc: roundTo(a.cpuAlloc, 4), MemAlloc: roundTo(a.memAlloc, 0),
 			ConditionReady: true,
@@ -787,13 +796,31 @@ func buildCapacityPopulation(namespaces []CapacityNamespaceRollup, nodes []Capac
 	var nCPUUnder, nCPUOK, nCPUOver, nMemUnder, nMemOK, nMemOver int
 	var nStorUnder, nStorOK, nStorOver int
 	var hasNodeStorage bool
+	clusterStor := map[string]struct{ used, lim float64 }{}
 	for _, n := range nodes {
 		accumulateBandClass(classifyUsedRatio(n.CPUUsage, n.CPUAlloc), &nCPUUnder, &nCPUOK, &nCPUOver)
 		accumulateBandClass(classifyUsedRatio(n.MemUsage, n.MemAlloc), &nMemUnder, &nMemOK, &nMemOver)
 		if n.StorageUsage != nil && n.StorageLimit != nil && *n.StorageLimit > 0 {
 			hasNodeStorage = true
 			accumulateBandClass(classifyUsedRatio(*n.StorageUsage, *n.StorageLimit), &nStorUnder, &nStorOK, &nStorOver)
+			env := n.Environment
+			if env == "" {
+				env = "_default"
+			}
+			s := clusterStor[env]
+			s.used += *n.StorageUsage
+			s.lim += *n.StorageLimit
+			clusterStor[env] = s
 		}
+	}
+	var clStorUnder, clStorOK, clStorOver int
+	var hasClusterStorage bool
+	for _, s := range clusterStor {
+		if s.lim <= 0 {
+			continue
+		}
+		hasClusterStorage = true
+		accumulateBandClass(classifyUsedRatio(s.used, s.lim), &clStorUnder, &clStorOK, &clStorOver)
 	}
 	clusterTotal := len(clusterCPU)
 	if clusterTotal == 0 && len(namespaces) > 0 {
@@ -804,13 +831,18 @@ func buildCapacityPopulation(namespaces []CapacityNamespaceRollup, nodes []Capac
 		b := fractionsToBand(bandFractionsFromCounts(nStorUnder, nStorOK, nStorOver))
 		nodeStorage = &b
 	}
+	var clusterStorage *CapacityEfficiencyBand
+	if hasClusterStorage {
+		b := fractionsToBand(bandFractionsFromCounts(clStorUnder, clStorOK, clStorOver))
+		clusterStorage = &b
+	}
 	return CapacityPopulation{
 		Clusters: CapacityPopulationScope{
 			Total: clusterTotal,
 			Bands: CapacityResourcePopulation{
 				CPU:     fractionsToBand(bandFractionsFromCounts(clCPUUnder, clCPUOK, clCPUOver)),
 				Mem:     fractionsToBand(bandFractionsFromCounts(clMemUnder, clMemOK, clMemOver)),
-				Storage: nodeStorage, // cluster storage mirrors node fs until PVC bands exist
+				Storage: clusterStorage,
 			},
 		},
 		Nodes: CapacityPopulationScope{
@@ -951,7 +983,55 @@ func capacityNodeAllocByNode(metric, resourceLabel, resource, envLabel, env stri
 	if m := envMatcher(envLabel, env); m != "" {
 		parts = append(parts, m)
 	}
-	return fmt.Sprintf(`sum by (node) (%s{%s})`, metric, strings.Join(parts, ","))
+	return fmt.Sprintf(`sum by (node, k8s_cluster_name) (%s{%s})`, metric, strings.Join(parts, ","))
+}
+
+func capacityNodeCPUUsageExpr(ctr otelconfig.ContainerMetrics, scope string) string {
+	return fmt.Sprintf(
+		`sum by (node, kubernetes_io_hostname, instance, k8s_cluster_name) (rate(%s{%s}[%s]))`,
+		ctr.CPUUsage, scope, capacityLookback,
+	)
+}
+
+func capacityNodeMemUsageExpr(ctr otelconfig.ContainerMetrics, scope string) string {
+	metric := ctr.MemoryWorkingSet
+	if metric == "" {
+		metric = ctr.MemoryUsage
+	}
+	return fmt.Sprintf(
+		`sum by (node, kubernetes_io_hostname, instance, k8s_cluster_name) (%s{%s})`,
+		metric, scope,
+	)
+}
+
+func capacityNodeFsExpr(metric, envLabel, env string) string {
+	parts := []string{`container=""`, `id="/"`}
+	if m := envMatcher(envLabel, env); m != "" {
+		parts = append(parts, m)
+	}
+	return fmt.Sprintf(
+		`sum by (node, kubernetes_io_hostname, instance, k8s_cluster_name) (%s{%s})`,
+		metric, strings.Join(parts, ","),
+	)
+}
+
+// promqlRegexLiteral encodes a regex as a PromQL double-quoted string literal.
+func promqlRegexLiteral(re string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range re {
+		switch r {
+		case '\\', '"':
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // capacityAppendWorkloadScope restricts PromQL selectors to pods for a workload.
@@ -960,11 +1040,15 @@ func capacityAppendWorkloadScope(scope, workload string) string {
 	if workload == "" {
 		return scope
 	}
-	return scope + fmt.Sprintf(`,pod=~"^%s(-.*)?$"`, regexp.QuoteMeta(workload))
+	re := `^` + regexp.QuoteMeta(workload) + `(-.*)?$`
+	return scope + `,pod=~` + promqlRegexLiteral(re)
 }
 
 func capacityCPUUsageExpr(ctr otelconfig.ContainerMetrics, scope string) string {
-	return fmt.Sprintf(`sum by (namespace, pod, container) (rate(%s{%s}[%s]))`, ctr.CPUUsage, scope, capacityLookback)
+	return fmt.Sprintf(
+		`sum by (namespace, pod, container, k8s_cluster_name) (rate(%s{%s}[%s]))`,
+		ctr.CPUUsage, scope, capacityLookback,
+	)
 }
 
 func capacityMemUsageExpr(ctr otelconfig.ContainerMetrics, scope string) string {
@@ -972,11 +1056,14 @@ func capacityMemUsageExpr(ctr otelconfig.ContainerMetrics, scope string) string 
 	if metric == "" {
 		metric = ctr.MemoryUsage
 	}
-	return fmt.Sprintf(`sum by (namespace, pod, container) (%s{%s})`, metric, scope)
+	return fmt.Sprintf(`sum by (namespace, pod, container, k8s_cluster_name) (%s{%s})`, metric, scope)
 }
 
 func capacityResourceExpr(metric, resource string, ctr otelconfig.ContainerMetrics, scope string) string {
-	return fmt.Sprintf(`sum by (namespace, pod, container) (%s{%s,%s="%s"})`, metric, scope, ctr.ResourceLabel, resource)
+	return fmt.Sprintf(
+		`sum by (namespace, pod, container, k8s_cluster_name) (%s{%s,%s="%s"})`,
+		metric, scope, ctr.ResourceLabel, resource,
+	)
 }
 
 func capacityWasteByNamespace(reqExpr, usageExpr string) string {
@@ -1023,7 +1110,7 @@ func capacityUnderProvisionedContainers(usageExpr, reqExpr string) string {
 
 func capacityThrottledContainers(ctr otelconfig.ContainerMetrics, scope string) string {
 	return fmt.Sprintf(
-		`sum by (namespace, pod, container) (rate(%s{%s}[%s])) > 0`,
+		`sum by (namespace, pod, container, k8s_cluster_name) (rate(%s{%s}[%s])) > 0`,
 		ctr.CPUThrottled, scope, capacityLookback,
 	)
 }
@@ -1195,10 +1282,7 @@ func (a *App) queryRecommendations(ctx context.Context, namespace, env string, f
 	logger := log.DefaultLogger.With("handler", "capacity-recs")
 	ctr := a.otelCfg.Runtime.Container
 	scope := capacityScope(namespace, env, a.otelCfg.Labels.DeploymentEnv)
-	window := to.Sub(from)
-	if window < time.Hour {
-		window = time.Hour
-	}
+	window := max(to.Sub(from), time.Hour)
 	memMetric := ctr.MemoryWorkingSet
 	if memMetric == "" {
 		memMetric = ctr.MemoryUsage
@@ -1237,10 +1321,7 @@ func (a *App) queryRecommendationsClickHouse(ctx context.Context, ch *queries.Cl
 	if ch == nil {
 		return empty
 	}
-	window := to.Sub(from)
-	if window < time.Hour {
-		window = time.Hour
-	}
+	window := max(to.Sub(from), time.Hour)
 	opts := queries.ClickHouseQueryOptions{From: from, To: to, Limit: 5000, SkipLimitEnforcement: true}
 
 	usageRes, err := ch.Query(ctx, chquery.CapacityUsageProbeSQL(from, to), opts)
@@ -1654,10 +1735,7 @@ func (a *App) queryHistoryProm(ctx context.Context, namespace, workload, contain
 	}
 	scope = capacityAppendWorkloadScope(scope, workload)
 
-	step := to.Sub(from) / 50
-	if step < 15*time.Second {
-		step = 15 * time.Second
-	}
+	step := max(to.Sub(from)/50, 15*time.Second)
 
 	memMetric := ctr.MemoryWorkingSet
 	if memMetric == "" {
@@ -1737,10 +1815,7 @@ func (a *App) queryHistoryClickHouse(ctx context.Context, ch *queries.ClickHouse
 		return empty
 	}
 
-	step := int((to.Sub(from) / 50).Seconds())
-	if step < 15 {
-		step = 15
-	}
+	step := max(int((to.Sub(from) / 50).Seconds()), 15)
 	histRes, err := ch.Query(ctx, chquery.CapacityHistorySeriesSQL(namespace, container, env, workload, from, to, step), opts)
 	if err != nil {
 		logger.Warn("capacity history CH series failed", "error", err)
@@ -1850,10 +1925,7 @@ func (a *App) queryForecastProm(ctx context.Context, resource, namespace, worklo
 		usageExpr, formatPromDuration(window), int((7 * 24 * time.Hour).Seconds()),
 	)
 
-	step := window / 50
-	if step < 15*time.Second {
-		step = 15 * time.Second
-	}
+	step := max(window/50, 15*time.Second)
 
 	usageRS, err := client.RangeQuery(ctx, usageExpr, from, to, step)
 	if err != nil {
@@ -1938,10 +2010,7 @@ func (a *App) queryForecastClickHouse(ctx context.Context, ch *queries.ClickHous
 		return empty
 	}
 
-	step := int((to.Sub(from) / 50).Seconds())
-	if step < 15 {
-		step = 15
-	}
+	step := max(int((to.Sub(from) / 50).Seconds()), 15)
 	histRes, err := ch.Query(ctx, chquery.CapacityHistorySeriesSQL(namespace, container, env, workload, from, to, step), opts)
 	if err != nil {
 		logger.Warn("capacity forecast CH series failed", "error", err)

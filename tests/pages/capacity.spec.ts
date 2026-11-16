@@ -8,13 +8,7 @@ test.describe('Capacity', () => {
 
   test('renders toolbar, empty-state, or table — never blank', async ({ page }) => {
     await expectAnyVisible(
-      [
-        page.getByText('Capacity metrics unavailable'),
-        page.getByPlaceholder('Filter namespace...'),
-        page.getByText('Waste by namespace'),
-        page.getByRole('alert'),
-        page.getByRole('tab', { name: /Overview/i }),
-      ],
+      [page.getByText('Capacity metrics unavailable'), page.getByText('Waste by namespace'), page.locator('table')],
       { message: 'Capacity page did not render any meaningful content' }
     );
   });
@@ -23,7 +17,7 @@ test.describe('Capacity', () => {
     const chrome = page
       .getByRole('heading', { name: /Capacity/i })
       .or(page.getByRole('link', { name: /Capacity/i }))
-      .or(page.getByPlaceholder('Filter namespace...'));
+      .or(page.getByRole('tab', { name: /Overview/i }));
     await expect(chrome.first()).toBeVisible({ timeout: 15_000 });
 
     await expect(page.getByRole('tab', { name: /Overview/i }).first()).toBeVisible({ timeout: 15_000 });

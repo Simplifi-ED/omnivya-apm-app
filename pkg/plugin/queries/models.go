@@ -125,7 +125,7 @@ type PluginSettings struct {
 	// CapacityCostRates overrides the on-demand unit rates used for Capacity
 	// reclaimable/deficit USD estimates. Zero values keep the built-in defaults
 	// ($0.0316/vCPU-hr, $0.0042/GiB-hr).
-	CapacityCostRates CapacityCostRates `json:"capacityCostRates,omitempty"`
+	CapacityCostRates CapacityCostRates `json:"capacityCostRates"`
 }
 
 // CapacityCostRates are hourly on-demand unit prices for Capacity savings estimates.
