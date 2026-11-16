@@ -6,25 +6,25 @@ test.describe('Capacity', () => {
     await gotoPage(`/${ROUTES.Capacity}`);
   });
 
-  test('renders overview, empty-state, or capability notice — never blank', async ({ page }) => {
+  test('renders toolbar, empty-state, or table — never blank', async ({ page }) => {
     await expectAnyVisible(
       [
         page.getByText('Capacity metrics unavailable'),
-        page.getByPlaceholder('Filter namespace'),
+        page.getByPlaceholder('Filter namespace...'),
         page.getByText('Waste by namespace'),
         page.getByRole('alert'),
-        page.getByText(/Resource efficiency/i),
+        page.getByRole('tab', { name: /Overview/i }),
       ],
       { message: 'Capacity page did not render any meaningful content' }
     );
   });
 
-  test('page heading and tabs are visible', async ({ page }) => {
-    const heading = page
+  test('nav chrome and tabs are visible', async ({ page }) => {
+    const chrome = page
       .getByRole('heading', { name: /Capacity/i })
-      .or(page.getByRole('heading', { name: /Application Observability/i }))
-      .or(page.getByRole('link', { name: /Capacity/i }));
-    await expect(heading.first()).toBeVisible({ timeout: 15_000 });
+      .or(page.getByRole('link', { name: /Capacity/i }))
+      .or(page.getByPlaceholder('Filter namespace...'));
+    await expect(chrome.first()).toBeVisible({ timeout: 15_000 });
 
     await expect(page.getByRole('tab', { name: /Overview/i }).first()).toBeVisible({ timeout: 15_000 });
     await expect(page.getByRole('tab', { name: /Right-sizing/i }).first()).toBeVisible();

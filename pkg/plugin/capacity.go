@@ -22,7 +22,7 @@ const (
 	capacityEnablementNote = "Capacity efficiency needs cAdvisor and kube-state-metrics " +
 		"(container_* and kube_pod_container_resource_*) on a Prometheus metricsDataSource (Path A) " +
 		"or the same series in ClickHouse. Deploy kube-state-metrics and a metrics agent that scrapes the kubelet. " +
-		"Neither Goldilocks nor CAST AI agents are required."
+		"No cluster agents (for example Goldilocks or VPA) are required."
 )
 
 // ---------------------------------------------------------------------------
@@ -40,7 +40,7 @@ type CapacityGapCounts struct {
 	ReservedWithoutUsage int `json:"reservedWithoutUsage"`
 }
 
-// CapacityEfficiency is the CAST AI-style provisioning and packing summary.
+// CapacityEfficiency summarizes used/requested/allocatable ratios and rate-based USD estimates.
 type CapacityEfficiency struct {
 	CPUUsedRatio          float64  `json:"cpuUsedRatio"`
 	MemUsedRatio          float64  `json:"memUsedRatio"`

@@ -2,7 +2,8 @@
 
 Kubernetes resource efficiency, right-sizing recommendations, history, and
 forecasts. All calculations use standard cAdvisor and kube-state-metrics series.
-Neither Goldilocks, VPA CRDs, nor CAST AI agents are required.
+Goldilocks-compatible right-sizing recommendations are computed in-plugin from
+the same series; no Goldilocks or VPA agents are required in the cluster.
 
 Experimental.
 

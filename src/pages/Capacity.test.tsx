@@ -56,13 +56,15 @@ jest.mock('../api/capacity', () => ({
 }));
 
 describe('Capacity page', () => {
-  it('shows enablement empty state when metrics are unavailable', async () => {
+  it('shows Jobs-style toolbar and enablement empty state', async () => {
     render(
       <MemoryRouter initialEntries={['/a/omnivya-apm-app/capacity']}>
         <Capacity />
       </MemoryRouter>
     );
-    expect(screen.getByRole('heading', { name: 'Capacity' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Filter namespace')).toBeInTheDocument();
+    expect(screen.getByTestId('time-controls')).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Overview' })).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByText('Capacity metrics unavailable')).toBeInTheDocument();
     });

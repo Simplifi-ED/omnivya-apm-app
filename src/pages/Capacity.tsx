@@ -1,8 +1,20 @@
 import React, { useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { PluginPage } from '@grafana/runtime';
-import { Alert, Badge, Button, Drawer, Input, Tab, TabContent, TabsBar, TextArea, useStyles2 } from '@grafana/ui';
-import { GrafanaTheme2, PageLayoutType } from '@grafana/data';
+import {
+  Alert,
+  Badge,
+  Button,
+  Drawer,
+  Icon,
+  Input,
+  RadioButtonGroup,
+  Tab,
+  TabsBar,
+  TextArea,
+  useStyles2,
+} from '@grafana/ui';
+import { GrafanaTheme2 } from '@grafana/data';
 import { css } from '@emotion/css';
 import {
   getCapacity,
@@ -24,6 +36,11 @@ import { HeaderTimeControls } from '../components/HeaderTimeControls';
 import { typographyFontSize } from '../utils/themeTypography';
 
 type CapTab = 'overview' | 'rightsizing' | 'history' | 'forecast';
+
+const FORECAST_RESOURCE_OPTIONS = [
+  { label: 'CPU', value: 'cpu' as const },
+  { label: 'Memory', value: 'memory' as const },
+];
 
 function pct(ratio: number): string {
   if (!Number.isFinite(ratio)) {
@@ -130,6 +147,13 @@ function Capacity() {
     { skip: tab !== 'forecast' || !histNs }
   );
 
+  const handleRefresh = () => {
+    refresh();
+    refetchOverview();
+    refetchRecs();
+    refetchFc();
+  };
+
   const gaps = overview?.gapCounts;
   const eff = overview?.efficiency;
 
@@ -147,38 +171,32 @@ function Capacity() {
   );
 
   return (
-    <PluginPage layout={PageLayoutType.Canvas}>
-      <div className={styles.page}>
+    <PluginPage>
+      <div className={styles.container}>
         <div className={styles.toolbar}>
-          <div>
-            <h2 className={styles.title}>Capacity</h2>
-            <p className={styles.subtitle}>
-              Resource efficiency and right-sizing from kube metrics. No Goldilocks or CAST AI agents required.
-            </p>
+          <div className={styles.scopeRow}>
+            <div className={styles.filterGroup}>
+              <div className={styles.filterItem}>
+                <Input
+                  aria-label="Filter namespace"
+                  prefix={<Icon name="search" />}
+                  placeholder="Filter namespace..."
+                  value={nsFilter}
+                  onChange={(e) => updateParams({ namespace: e.currentTarget.value || null })}
+                />
+              </div>
+              <div className={styles.filterItem}>
+                <Input
+                  aria-label="Environment"
+                  prefix={<Icon name="cloud" />}
+                  placeholder="Environment (cluster)"
+                  value={env}
+                  onChange={(e) => updateParams({ environment: e.currentTarget.value || null })}
+                />
+              </div>
+            </div>
+            <HeaderTimeControls onRefresh={handleRefresh} />
           </div>
-          <HeaderTimeControls
-            onRefresh={() => {
-              refresh();
-              refetchOverview();
-              refetchRecs();
-              refetchFc();
-            }}
-          />
-        </div>
-
-        <div className={styles.filters}>
-          <Input
-            width={24}
-            placeholder="Filter namespace"
-            value={nsFilter}
-            onChange={(e) => updateParams({ namespace: e.currentTarget.value || null })}
-          />
-          <Input
-            width={24}
-            placeholder="Environment (cluster)"
-            value={env}
-            onChange={(e) => updateParams({ environment: e.currentTarget.value || null })}
-          />
         </div>
 
         <TabsBar>
@@ -199,19 +217,22 @@ function Capacity() {
           ))}
         </TabsBar>
 
-        <TabContent className={styles.tabContent}>
+        <div className={styles.tabContent}>
           {tab === 'overview' && (
             <DataState
               loading={overviewLoading}
               error={overviewError}
               empty={overview != null && !overview.available}
               emptyTitle="Capacity metrics unavailable"
-              emptyMessage={overview?.enablementNote || 'Deploy kube-state-metrics and cAdvisor scrapes.'}
+              emptyMessage={
+                overview?.enablementNote ||
+                'Deploy kube-state-metrics and cAdvisor scrapes to a Prometheus metricsDataSource.'
+              }
               skeleton={<TableSkeleton rows={8} />}
             >
               {overview && overview.available && (
                 <>
-                  <div className={styles.effBar}>
+                  <div className={styles.effBar} role="group" aria-label="Efficiency summary">
                     <div className={styles.effStat}>
                       <div className={styles.effLabel}>CPU used / requested</div>
                       <div className={styles.effValue}>{pct(eff?.cpuUsedRatio ?? 0)}</div>
@@ -235,12 +256,12 @@ function Capacity() {
                   </div>
                   {eff?.ratesAreEstimates && (
                     <p className={styles.rateNote}>
-                      USD figures are rate-based estimates (${eff.cpuHourUsd}/vCPU-hr, ${eff.memoryGibHourUsd}/GiB-hr),
-                      not cloud billing.
+                      USD figures are rate-based estimates (${eff.cpuHourUsd}/vCPU-hr, ${eff.memoryGibHourUsd}
+                      /GiB-hr), not cloud billing.
                     </p>
                   )}
 
-                  <div className={styles.tiles}>
+                  <div className={styles.tiles} role="group" aria-label="Gap counts">
                     {gapTiles.map((t) => (
                       <div key={t.label} className={styles.tile}>
                         <div className={styles.tileValue}>{t.value}</div>
@@ -250,14 +271,14 @@ function Capacity() {
                   </div>
 
                   <h3 className={styles.sectionTitle}>Waste by namespace</h3>
-                  <table className={styles.table}>
+                  <table className={styles.table} aria-label="Waste by namespace">
                     <thead>
                       <tr>
-                        <th>Namespace</th>
-                        <th>Waste CPU</th>
-                        <th>Waste mem</th>
-                        <th>Reclaimable / mo</th>
-                        <th>Gaps</th>
+                        <th scope="col">Namespace</th>
+                        <th scope="col">Waste CPU</th>
+                        <th scope="col">Waste mem</th>
+                        <th scope="col">Reclaimable / mo</th>
+                        <th scope="col">Gaps</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -287,13 +308,13 @@ function Capacity() {
                   </table>
 
                   <h3 className={styles.sectionTitle}>Top waste CPU</h3>
-                  <table className={styles.table}>
+                  <table className={styles.table} aria-label="Top waste CPU">
                     <thead>
                       <tr>
-                        <th>Namespace</th>
-                        <th>Pod</th>
-                        <th>Container</th>
-                        <th>Waste CPU</th>
+                        <th scope="col">Namespace</th>
+                        <th scope="col">Pod</th>
+                        <th scope="col">Container</th>
+                        <th scope="col">Waste CPU</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -309,13 +330,13 @@ function Capacity() {
                   </table>
 
                   <h3 className={styles.sectionTitle}>Top waste memory</h3>
-                  <table className={styles.table}>
+                  <table className={styles.table} aria-label="Top waste memory">
                     <thead>
                       <tr>
-                        <th>Namespace</th>
-                        <th>Pod</th>
-                        <th>Container</th>
-                        <th>Waste mem</th>
+                        <th scope="col">Namespace</th>
+                        <th scope="col">Pod</th>
+                        <th scope="col">Container</th>
+                        <th scope="col">Waste mem</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -331,13 +352,13 @@ function Capacity() {
                   </table>
 
                   <h3 className={styles.sectionTitle}>Top risk containers</h3>
-                  <table className={styles.table}>
+                  <table className={styles.table} aria-label="Top risk containers">
                     <thead>
                       <tr>
-                        <th>Namespace</th>
-                        <th>Pod</th>
-                        <th>Container</th>
-                        <th>Risk</th>
+                        <th scope="col">Namespace</th>
+                        <th scope="col">Pod</th>
+                        <th scope="col">Container</th>
+                        <th scope="col">Risk</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -377,16 +398,16 @@ function Capacity() {
             >
               {recs && recs.available && (
                 <>
-                  <table className={styles.table}>
+                  <table className={styles.table} aria-label="Workload right-sizing">
                     <thead>
                       <tr>
-                        <th>Workload</th>
-                        <th>Container</th>
-                        <th>QoS</th>
-                        <th>Confidence</th>
-                        <th>Burstable CPU</th>
-                        <th>Burstable mem</th>
-                        <th>Reclaimable</th>
+                        <th scope="col">Workload</th>
+                        <th scope="col">Container</th>
+                        <th scope="col">QoS</th>
+                        <th scope="col">Confidence</th>
+                        <th scope="col">Burstable CPU</th>
+                        <th scope="col">Burstable mem</th>
+                        <th scope="col">Reclaimable</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -439,7 +460,6 @@ function Capacity() {
                             if (env) {
                               extra.environment = env;
                             }
-                            // Prefer workload name as service id when it matches APM service naming.
                             appNavigate(
                               `services/${encodeURIComponent(selectedRec.namespace)}/${encodeURIComponent(selectedRec.workloadName)}`,
                               extra
@@ -458,13 +478,16 @@ function Capacity() {
 
           {tab === 'history' && (
             <>
-              <div className={styles.filters}>
-                <Input
-                  width={28}
-                  placeholder="Namespace for history"
-                  value={histNs}
-                  onChange={(e) => updateParams({ histNs: e.currentTarget.value || null })}
-                />
+              <div className={styles.viewRow}>
+                <div className={styles.filterItem}>
+                  <Input
+                    aria-label="Namespace for history"
+                    prefix={<Icon name="layer-group" />}
+                    placeholder="Namespace for history..."
+                    value={histNs}
+                    onChange={(e) => updateParams({ histNs: e.currentTarget.value || null })}
+                  />
+                </div>
               </div>
               {!histNs && (
                 <Alert severity="info" title="Pick a namespace">
@@ -483,12 +506,12 @@ function Capacity() {
                   {history && history.available && (
                     <>
                       {history.note && <p className={styles.rateNote}>{history.note}</p>}
-                      <table className={styles.table}>
+                      <table className={styles.table} aria-label="Capacity history">
                         <thead>
                           <tr>
-                            <th>Series</th>
-                            <th>Points</th>
-                            <th>Latest</th>
+                            <th scope="col">Series</th>
+                            <th scope="col">Points</th>
+                            <th scope="col">Latest</th>
                           </tr>
                         </thead>
                         <tbody>
@@ -516,25 +539,22 @@ function Capacity() {
 
           {tab === 'forecast' && (
             <>
-              <div className={styles.filters}>
-                <Input
-                  width={28}
-                  placeholder="Namespace for forecast"
-                  value={histNs}
-                  onChange={(e) => updateParams({ histNs: e.currentTarget.value || null })}
+              <div className={styles.viewRow}>
+                <div className={styles.filterItem}>
+                  <Input
+                    aria-label="Namespace for forecast"
+                    prefix={<Icon name="layer-group" />}
+                    placeholder="Namespace for forecast..."
+                    value={histNs}
+                    onChange={(e) => updateParams({ histNs: e.currentTarget.value || null })}
+                  />
+                </div>
+                <RadioButtonGroup
+                  size="sm"
+                  options={FORECAST_RESOURCE_OPTIONS}
+                  value={forecastResource}
+                  onChange={setForecastResource}
                 />
-                <Button
-                  variant={forecastResource === 'cpu' ? 'primary' : 'secondary'}
-                  onClick={() => setForecastResource('cpu')}
-                >
-                  CPU
-                </Button>
-                <Button
-                  variant={forecastResource === 'memory' ? 'primary' : 'secondary'}
-                  onClick={() => setForecastResource('memory')}
-                >
-                  Memory
-                </Button>
               </div>
               {!histNs && (
                 <Alert severity="info" title="Pick a namespace">
@@ -555,24 +575,26 @@ function Capacity() {
                       <p className={styles.rateNote}>
                         Method: {forecast.methodLabel} ({forecast.method}). Not a billing forecast.
                       </p>
-                      {forecast.daysToRequest != null && (
-                        <Badge text={`~${forecast.daysToRequest.toFixed(1)}d to request`} color="orange" />
-                      )}{' '}
-                      {forecast.daysToLimit != null && (
-                        <Badge text={`~${forecast.daysToLimit.toFixed(1)}d to limit`} color="red" />
-                      )}
-                      <table className={styles.table}>
+                      <div className={styles.viewRow}>
+                        {forecast.daysToRequest != null && (
+                          <Badge text={`~${forecast.daysToRequest.toFixed(1)}d to request`} color="orange" />
+                        )}
+                        {forecast.daysToLimit != null && (
+                          <Badge text={`~${forecast.daysToLimit.toFixed(1)}d to limit`} color="red" />
+                        )}
+                      </div>
+                      <table className={styles.table} aria-label="Capacity forecast">
                         <thead>
                           <tr>
-                            <th>Series</th>
-                            <th>Points</th>
-                            <th>End value</th>
+                            <th scope="col">Series</th>
+                            <th scope="col">Points</th>
+                            <th scope="col">End value</th>
                           </tr>
                         </thead>
                         <tbody>
                           {forecast.series.map((s) => (
                             <tr key={s.name}>
-                              <td>{s.name}</td>
+                              <td className={styles.nameCell}>{s.name}</td>
                               <td>{s.points.length}</td>
                               <td>
                                 {s.points.length
@@ -591,39 +613,50 @@ function Capacity() {
               )}
             </>
           )}
-        </TabContent>
+        </div>
       </div>
     </PluginPage>
   );
 }
 
 const getStyles = (theme: GrafanaTheme2) => ({
-  page: css`
-    padding: ${theme.spacing(2)};
+  container: css`
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    padding: 0;
+    overflow: hidden;
   `,
   toolbar: css`
     display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: ${theme.spacing(2)};
-    margin-bottom: ${theme.spacing(2)};
-    flex-wrap: wrap;
+    flex-direction: column;
+    gap: ${theme.spacing(1)};
+    margin-bottom: ${theme.spacing(1)};
+    z-index: 2;
   `,
-  title: css`
-    margin: 0;
-    font-size: ${typographyFontSize(theme, 'lg')};
-  `,
-  subtitle: css`
-    margin: ${theme.spacing(0.5)} 0 0;
-    color: ${theme.colors.text.secondary};
-    font-size: ${typographyFontSize(theme, 'sm')};
-  `,
-  filters: css`
+  scopeRow: css`
     display: flex;
     gap: ${theme.spacing(1)};
-    margin: ${theme.spacing(2)} 0;
-    flex-wrap: wrap;
     align-items: center;
+  `,
+  viewRow: css`
+    display: flex;
+    gap: ${theme.spacing(1)};
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: ${theme.spacing(2)};
+  `,
+  filterGroup: css`
+    display: flex;
+    flex: 1;
+    gap: ${theme.spacing(1)};
+    align-items: center;
+    min-width: 0;
+  `,
+  filterItem: css`
+    flex: 1;
+    min-width: 160px;
+    max-width: 320px;
   `,
   tabContent: css`
     margin-top: ${theme.spacing(2)};
@@ -631,11 +664,12 @@ const getStyles = (theme: GrafanaTheme2) => ({
   effBar: css`
     display: flex;
     flex-wrap: wrap;
-    gap: ${theme.spacing(2)};
+    gap: ${theme.spacing(1)};
     margin-bottom: ${theme.spacing(2)};
   `,
   effStat: css`
     background: ${theme.colors.background.secondary};
+    border: 1px solid ${theme.colors.border.weak};
     border-radius: ${theme.shape.radius.default};
     padding: ${theme.spacing(1.5)} ${theme.spacing(2)};
     min-width: 120px;
@@ -647,21 +681,24 @@ const getStyles = (theme: GrafanaTheme2) => ({
   effValue: css`
     font-size: ${typographyFontSize(theme, 'md')};
     font-weight: ${theme.typography.fontWeightMedium};
+    font-variant-numeric: tabular-nums;
   `,
   effValueGood: css`
     font-size: ${typographyFontSize(theme, 'md')};
     font-weight: ${theme.typography.fontWeightMedium};
+    font-variant-numeric: tabular-nums;
     color: ${theme.colors.success.text};
   `,
   effValueWarn: css`
     font-size: ${typographyFontSize(theme, 'md')};
     font-weight: ${theme.typography.fontWeightMedium};
+    font-variant-numeric: tabular-nums;
     color: ${theme.colors.warning.text};
   `,
   rateNote: css`
     color: ${theme.colors.text.secondary};
     font-size: ${typographyFontSize(theme, 'sm')};
-    margin: ${theme.spacing(1)} 0 ${theme.spacing(2)};
+    margin: 0 0 ${theme.spacing(2)};
   `,
   tiles: css`
     display: flex;
@@ -671,6 +708,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
   `,
   tile: css`
     background: ${theme.colors.background.secondary};
+    border: 1px solid ${theme.colors.border.weak};
     border-radius: ${theme.shape.radius.default};
     padding: ${theme.spacing(1.5)};
     min-width: 110px;
@@ -679,6 +717,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
   tileValue: css`
     font-size: ${typographyFontSize(theme, 'md')};
     font-weight: ${theme.typography.fontWeightMedium};
+    font-variant-numeric: tabular-nums;
   `,
   tileLabel: css`
     color: ${theme.colors.text.secondary};
@@ -687,20 +726,25 @@ const getStyles = (theme: GrafanaTheme2) => ({
   sectionTitle: css`
     margin: ${theme.spacing(3)} 0 ${theme.spacing(1)};
     font-size: ${typographyFontSize(theme, 'base')};
+    font-weight: ${theme.typography.fontWeightMedium};
   `,
   table: css`
     width: 100%;
-    border-collapse: collapse;
+    border-collapse: separate;
+    border-spacing: 0;
     th {
       text-align: left;
-      padding: ${theme.spacing(1)};
+      padding: ${theme.spacing(1)} ${theme.spacing(1.5)};
       color: ${theme.colors.text.secondary};
-      border-bottom: 1px solid ${theme.colors.border.medium};
       font-size: ${typographyFontSize(theme, 'sm')};
+      font-weight: ${theme.typography.fontWeightMedium};
+      border-bottom: 1px solid ${theme.colors.border.medium};
+      white-space: nowrap;
     }
     td {
-      padding: ${theme.spacing(1)};
+      padding: ${theme.spacing(1)} ${theme.spacing(1.5)};
       border-bottom: 1px solid ${theme.colors.border.weak};
+      vertical-align: middle;
     }
   `,
   row: css`
@@ -711,6 +755,7 @@ const getStyles = (theme: GrafanaTheme2) => ({
   `,
   nameCell: css`
     font-weight: ${theme.typography.fontWeightMedium};
+    color: ${theme.colors.text.primary};
   `,
   muted: css`
     color: ${theme.colors.text.secondary};

@@ -892,7 +892,7 @@ paths:
   /capacity:
     get:
       tags: [experimental]
-      summary: Fleet Kubernetes resource efficiency (waste, gaps, CAST AI-style savings estimates).
+      summary: Fleet Kubernetes resource efficiency (waste, gaps, rate-based savings estimates).
       parameters:
         - { $ref: "#/components/parameters/namespaceQuery" }
         - { $ref: "#/components/parameters/environment" }

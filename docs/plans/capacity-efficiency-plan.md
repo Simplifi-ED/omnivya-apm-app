@@ -84,7 +84,7 @@ Each live lane runs on its own cloud VM at the PR head. Drive through `control-u
 
 - [ ] Add typed domain `CapacityResource`, `CapacityGap`, `CapacityContainer`, `CapacityNamespaceRollup`, `CapacityEfficiencyScore`, `WorkloadRecommendation`, and `CapacityOverview` in `pkg/plugin/capacity.go` (or models) so illegal mixes of units cannot compile.
 - [ ] Add `GET /capacity` that returns `{ available, enablementNote?, efficiency, environments?, namespaces[], gapCounts, topWasteCpu[], topWasteMem[], topRiskContainers[] }` at instant `to`, filtered by optional `environment` and `namespace`.
-- [ ] Compute CAST AI efficiency ratios (`used / requested`, plus `requested / allocatable` when `kube_node_status_allocatable` exists) and rate-based monthly waste/savings estimates (`$0.0316/vCPU-hr`, `$0.0042/GiB-hr` defaults, overridable in plugin JSON config).
+- [ ] Compute efficiency ratios (`used / requested`, plus `requested / allocatable` when `kube_node_status_allocatable` exists) and rate-based monthly waste/savings estimates (`$0.0316/vCPU-hr`, `$0.0042/GiB-hr` defaults, overridable in plugin JSON config).
 - [ ] Surface under-provisioned (`usage > request`) and CFS-throttled (`container_cpu_cfs_throttled_seconds_total`) containers alongside over-requested waste.
 - [ ] Dual-path like Jobs. Path A is Prometheus or Mimir via `a.prom(ctx)`. Path B is ClickHouse via `chquery` when `clickStackMode` is on. Return `available:false` when neither path has series.
 - [ ] Compute waste with PromQL `clamp_min(request - usage, 0)` at identity `(namespace, pod, container)`, then `sum by (namespace)` and `topk` for lists (strategy A from Appendix A). Never clamp at coarser grain.
@@ -153,7 +153,7 @@ Each live lane runs on its own cloud VM at the PR head. Drive through `control-u
 **Build.**
 
 - [ ] Add top-level nav item **Capacity** at `/a/omnivya-apm-app/capacity`, peer to Jobs, not under My Apps.
-- [ ] Page shows CAST AI efficiency summary bar (used vs requested vs allocatable + estimated monthly reclaimable spend with rate disclosure), gap/risk count tiles (including under-provisioned and throttled), waste-by-namespace table, and top waste/risk container lists from `GET /capacity`.
+- [ ] Page shows efficiency summary bar (used vs requested vs allocatable + estimated monthly reclaimable spend with rate disclosure), gap/risk count tiles (including under-provisioned and throttled), waste-by-namespace table, and top waste/risk container lists from `GET /capacity`.
 - [ ] Empty and `available:false` states reuse Jobs-style enablement copy patterns.
 - [ ] Time range and environment filters use shared `useTimeRange` and URL params per `docs/url-contract.md`.
 
