@@ -1,4 +1,5 @@
 import React, { useCallback } from 'react';
+import { InlineField, Stack } from '@grafana/ui';
 import { useTimeRange } from '../utils/timeRange';
 import { useUrlParams } from '../utils/useUrlState';
 import { AppTimeRangePicker } from './AppTimeRangePicker';
@@ -27,6 +28,9 @@ export interface HeaderTimeControlsProps {
  * timestamps. Absolute picks and move/zoom freeze the window as ISO strings.
  * Every write goes through useUrlParams so from+to land in ONE atomic URL
  * transaction (one history entry).
+ *
+ * Wrapped in a single Stack so parent flex layouts (space-between toolbars)
+ * treat range + refresh as one group — never stretch them apart.
  */
 export function HeaderTimeControls({ onRefresh, defaultRefresh, isLoading }: HeaderTimeControlsProps) {
   const { from, to, fromMs, toMs, refresh } = useTimeRange();
@@ -40,9 +44,13 @@ export function HeaderTimeControls({ onRefresh, defaultRefresh, isLoading }: Hea
   );
 
   return (
-    <>
-      <AppTimeRangePicker from={from} to={to} fromMs={fromMs} toMs={toMs} onChange={onChange} />
-      <RefreshControl onRefresh={onRefresh ?? refresh} defaultInterval={defaultRefresh} isLoading={isLoading} />
-    </>
+    <Stack direction="row" gap={1} alignItems="center" wrap="wrap" data-testid="header-time-controls">
+      <InlineField label="Time range" noMargin>
+        <AppTimeRangePicker from={from} to={to} fromMs={fromMs} toMs={toMs} onChange={onChange} />
+      </InlineField>
+      <InlineField label="Refresh" noMargin>
+        <RefreshControl onRefresh={onRefresh ?? refresh} defaultInterval={defaultRefresh} isLoading={isLoading} />
+      </InlineField>
+    </Stack>
   );
 }
