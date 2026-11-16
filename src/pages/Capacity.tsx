@@ -4,14 +4,21 @@ import { PluginPage } from '@grafana/runtime';
 import {
   Alert,
   Badge,
+  Box,
   Button,
   Combobox,
   Drawer,
+  InlineField,
+  InteractiveTable,
   RadioButtonGroup,
+  Stack,
   Tab,
   TabsBar,
+  Text,
   TextArea,
+  Tooltip,
   useStyles2,
+  type Column,
 } from '@grafana/ui';
 import { GrafanaTheme2 } from '@grafana/data';
 import { css } from '@emotion/css';
@@ -23,6 +30,7 @@ import {
   CapacityOverview,
   CapacityNamespaceRollup,
   CapacityNodeRollup,
+  CapacityContainerRow,
   WorkloadRecommendation,
   CapacityHistoryResponse,
   CapacityForecastResponse,
@@ -34,9 +42,9 @@ import { useAppNavigate, sanitizeParam } from '../utils/navigation';
 import { useUrlParams } from '../utils/useUrlState';
 import { useFetch } from '../utils/useFetch';
 import { HeaderTimeControls } from '../components/HeaderTimeControls';
-import { typographyFontSize } from '../utils/themeTypography';
 import { extractEnvironmentOptions, extractNamespaceOptions } from '../utils/options';
 import { EfficiencyCards } from './capacity/EfficiencyCards';
+import { PredictChartPanel } from './capacity/PredictChartPanel';
 
 type CapTab = 'overview' | 'namespaces' | 'nodes' | 'rightsizing';
 
@@ -87,20 +95,28 @@ function formatUsd(v: number): string {
   return `$${v.toFixed(0)}`;
 }
 
-function usageBar(ratio: number | undefined, styles: ReturnType<typeof getStyles>): React.ReactNode {
+function UsageBarCell({ ratio }: { ratio?: number }) {
+  const styles = useStyles2(getStyles);
   if (ratio == null || !Number.isFinite(ratio) || ratio <= 0) {
-    return <span className={styles.muted}>—</span>;
+    return (
+      <Text variant="bodySmall" color="disabled">
+        —
+      </Text>
+    );
   }
-  const clamped = Math.min(ratio, 1.2);
-  const width = `${Math.min(clamped, 1) * 100}%`;
+  const width = `${Math.min(ratio, 1) * 100}%`;
   const colorClass = ratio > 0.8 ? styles.barOver : ratio < 0.4 ? styles.barUnder : styles.barOk;
   return (
-    <div className={styles.usageCell}>
-      <div className={styles.usageTrack}>
-        <div className={`${styles.usageFill} ${colorClass}`} style={{ width }} />
+    <Tooltip content={`${(ratio * 100).toFixed(1)}% of capacity/request`}>
+      <div className={styles.usageCell}>
+        <div className={styles.usageTrack}>
+          <div className={`${styles.usageFill} ${colorClass}`} style={{ width }} />
+        </div>
+        <Text variant="bodySmall" tabular>
+          {pct(ratio)}
+        </Text>
       </div>
-      <span className={styles.usagePct}>{pct(ratio)}</span>
-    </div>
+    </Tooltip>
   );
 }
 
@@ -116,7 +132,6 @@ function Capacity() {
   const tab: CapTab = ['overview', 'namespaces', 'nodes', 'rightsizing'].includes(tabParam) ? tabParam : 'overview';
   const [selectedRec, setSelectedRec] = useState<WorkloadRecommendation | null>(null);
   const [predict, setPredict] = useState<PredictTarget | null>(null);
-  const [expandedNode, setExpandedNode] = useState<string | null>(null);
 
   const {
     data: overview,
@@ -206,10 +221,6 @@ function Capacity() {
     refetchRecs();
   };
 
-  const openPredict = (target: PredictTarget) => {
-    setPredict(target);
-  };
-
   const filteredNamespaces: CapacityNamespaceRollup[] = useMemo(() => {
     const rows = overview?.namespaces ?? [];
     if (!nsFilter) {
@@ -218,36 +229,265 @@ function Capacity() {
     return rows.filter((r) => r.namespace === nsFilter);
   }, [overview?.namespaces, nsFilter]);
 
-  const nodes: CapacityNodeRollup[] = overview?.nodes ?? [];
+  const nodes: CapacityNodeRollup[] = useMemo(() => overview?.nodes ?? [], [overview?.nodes]);
+  const topWasteCpu: CapacityContainerRow[] = useMemo(() => overview?.topWasteCpu ?? [], [overview?.topWasteCpu]);
+  const recommendations: WorkloadRecommendation[] = useMemo(() => recs?.recommendations ?? [], [recs?.recommendations]);
+
+  const nsColumns = useMemo<Array<Column<CapacityNamespaceRollup>>>(
+    () => [
+      {
+        id: 'namespace',
+        header: 'Namespace',
+        sortType: 'alphanumeric',
+        cell: ({ row }) => {
+          const ns = row.original;
+          return (
+            <Stack direction="column" gap={0}>
+              <Button
+                variant="secondary"
+                fill="text"
+                size="sm"
+                onClick={() => {
+                  const extra: Record<string, string> = {};
+                  if (env) {
+                    extra.environment = env;
+                  }
+                  appNavigate(`namespaces/${encodeURIComponent(ns.namespace)}`, extra);
+                }}
+              >
+                {ns.namespace}
+              </Button>
+              {ns.environment ? (
+                <Text variant="bodySmall" color="secondary">
+                  {ns.environment}
+                </Text>
+              ) : null}
+            </Stack>
+          );
+        },
+      },
+      {
+        id: 'cpuUsedRatio',
+        header: 'CPU usage',
+        sortType: 'basic',
+        cell: ({ row }) => <UsageBarCell ratio={row.original.cpuUsedRatio} />,
+      },
+      {
+        id: 'memUsedRatio',
+        header: 'Mem usage',
+        sortType: 'basic',
+        cell: ({ row }) => <UsageBarCell ratio={row.original.memUsedRatio} />,
+      },
+      {
+        id: 'wasteCpu',
+        header: 'Waste CPU',
+        sortType: 'basic',
+        cell: ({ row }) => (
+          <Text variant="bodySmall" tabular>
+            {formatCores(row.original.wasteCpu)}
+          </Text>
+        ),
+      },
+      {
+        id: 'wasteMem',
+        header: 'Waste mem',
+        sortType: 'basic',
+        cell: ({ row }) => (
+          <Text variant="bodySmall" tabular>
+            {formatBytes(row.original.wasteMem)}
+          </Text>
+        ),
+      },
+      {
+        id: 'gaps',
+        header: 'Gaps',
+        cell: ({ row }) => {
+          const n =
+            row.original.missingRequest +
+            row.original.missingLimit +
+            row.original.underProvisioned +
+            row.original.throttled;
+          return (
+            <Text variant="bodySmall" color="secondary" tabular>
+              {n || '—'}
+            </Text>
+          );
+        },
+      },
+      {
+        id: 'predict',
+        header: 'Predict',
+        cell: ({ row }) => (
+          <Stack direction="row" gap={1}>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setPredict({ namespace: row.original.namespace, resource: 'cpu' })}
+            >
+              Predict CPU
+            </Button>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => setPredict({ namespace: row.original.namespace, resource: 'memory' })}
+            >
+              Predict Mem
+            </Button>
+          </Stack>
+        ),
+      },
+    ],
+    [appNavigate, env]
+  );
+
+  const wasteColumns = useMemo<Array<Column<CapacityContainerRow>>>(
+    () => [
+      { id: 'namespace', header: 'Namespace', sortType: 'alphanumeric' },
+      { id: 'pod', header: 'Pod', sortType: 'alphanumeric' },
+      { id: 'container', header: 'Container', sortType: 'alphanumeric' },
+      {
+        id: 'wasteCpu',
+        header: 'Waste CPU',
+        sortType: 'basic',
+        cell: ({ row }) => (
+          <Text variant="bodySmall" tabular>
+            {formatCores(row.original.wasteCpu ?? 0)}
+          </Text>
+        ),
+      },
+    ],
+    []
+  );
+
+  const nodeColumns = useMemo<Array<Column<CapacityNodeRollup>>>(
+    () => [
+      {
+        id: 'node',
+        header: 'Node',
+        sortType: 'alphanumeric',
+        cell: ({ row }) => (
+          <Stack direction="column" gap={0}>
+            <Text weight="medium">{row.original.node}</Text>
+            {row.original.environment ? (
+              <Text variant="bodySmall" color="secondary">
+                {row.original.environment}
+              </Text>
+            ) : null}
+          </Stack>
+        ),
+      },
+      {
+        id: 'cpuUsedRatio',
+        header: 'CPU',
+        sortType: 'basic',
+        cell: ({ row }) => <UsageBarCell ratio={row.original.cpuUsedRatio} />,
+      },
+      {
+        id: 'memUsedRatio',
+        header: 'Memory',
+        sortType: 'basic',
+        cell: ({ row }) => <UsageBarCell ratio={row.original.memUsedRatio} />,
+      },
+      {
+        id: 'storageRatio',
+        header: 'Storage',
+        cell: ({ row }) =>
+          row.original.storageRatio != null ? (
+            <UsageBarCell ratio={row.original.storageRatio} />
+          ) : (
+            <Text variant="bodySmall" color="disabled">
+              No data
+            </Text>
+          ),
+      },
+      {
+        id: 'conditionReady',
+        header: 'Status',
+        cell: ({ row }) => (
+          <Badge
+            text={row.original.conditionReady ? 'Ready' : 'NotReady'}
+            color={row.original.conditionReady ? 'green' : 'red'}
+          />
+        ),
+      },
+    ],
+    []
+  );
+
+  const recColumns = useMemo<Array<Column<WorkloadRecommendation>>>(
+    () => [
+      {
+        id: 'workloadName',
+        header: 'Workload',
+        sortType: 'alphanumeric',
+        cell: ({ row }) => (
+          <Stack direction="column" gap={0}>
+            <Button variant="secondary" fill="text" size="sm" onClick={() => setSelectedRec(row.original)}>
+              {row.original.workloadKind}/{row.original.workloadName}
+            </Button>
+            <Text variant="bodySmall" color="secondary">
+              {row.original.namespace}
+            </Text>
+          </Stack>
+        ),
+      },
+      { id: 'container', header: 'Container', sortType: 'alphanumeric' },
+      { id: 'qosClass', header: 'QoS', sortType: 'alphanumeric' },
+      {
+        id: 'confidence',
+        header: 'Confidence',
+        cell: ({ row }) => (
+          <Badge text={row.original.confidence} color={row.original.confidence === 'high' ? 'green' : 'orange'} />
+        ),
+      },
+      {
+        id: 'reclaimableMonthlyUsd',
+        header: 'Reclaimable / mo',
+        sortType: 'basic',
+        cell: ({ row }) => (
+          <Text variant="bodySmall" tabular>
+            {formatUsd(row.original.reclaimableMonthlyUsd)}
+          </Text>
+        ),
+      },
+    ],
+    []
+  );
+
+  const historyForResource = useMemo(() => {
+    const all = history?.series ?? [];
+    const want =
+      predict?.resource === 'memory' ? ['memUsage', 'memRequest', 'memLimit'] : ['cpuUsage', 'cpuRequest', 'cpuLimit'];
+    const filtered = all.filter((s) => want.includes(s.name));
+    return filtered.length ? filtered : all;
+  }, [history?.series, predict?.resource]);
 
   return (
     <PluginPage>
-      <div className={styles.container}>
-        <div className={styles.toolbar}>
-          <div className={styles.scopeRow}>
-            <div className={styles.filterGroup}>
-              <div className={styles.filterItem}>
-                <Combobox
-                  options={nsOptions}
-                  value={nsFilter}
-                  onChange={(v) => updateParams({ namespace: v?.value || null })}
-                  placeholder="Filter namespaces"
-                  width={32}
-                />
-              </div>
-              <div className={styles.filterItem}>
-                <Combobox
-                  options={envOptions}
-                  value={env}
-                  onChange={(v) => updateParams({ environment: v?.value || null })}
-                  placeholder="Filter environments"
-                  width={32}
-                />
-              </div>
-            </div>
-            <HeaderTimeControls onRefresh={handleRefresh} />
-          </div>
-        </div>
+      <Stack direction="column" gap={2}>
+        <Stack direction="row" justifyContent="space-between" alignItems="center" wrap="wrap" gap={2}>
+          <Stack direction="row" gap={1.5} alignItems="center" wrap="wrap">
+            <InlineField label="Namespace" noMargin>
+              <Combobox
+                options={nsOptions}
+                value={nsFilter}
+                onChange={(v) => updateParams({ namespace: v?.value || null })}
+                placeholder="All namespaces"
+                width={26}
+              />
+            </InlineField>
+            <InlineField label="Environment" noMargin>
+              <Combobox
+                options={envOptions}
+                value={env}
+                onChange={(v) => updateParams({ environment: v?.value || null })}
+                placeholder="All environments"
+                width={26}
+              />
+            </InlineField>
+          </Stack>
+          <HeaderTimeControls onRefresh={handleRefresh} />
+        </Stack>
 
         <TabsBar>
           {(
@@ -267,314 +507,261 @@ function Capacity() {
           ))}
         </TabsBar>
 
-        <div className={styles.tabContent}>
-          {(tab === 'overview' || tab === 'namespaces' || tab === 'nodes') && (
-            <DataState
-              loading={overviewLoading}
-              error={overviewError}
-              empty={overview != null && !overview.available}
-              emptyTitle="Capacity metrics unavailable"
-              emptyMessage={
-                overview?.enablementNote ||
-                'Deploy kube-state-metrics and cAdvisor scrapes to Prometheus (Path A) or ClickHouse otel_metrics_* (Path B).'
-              }
-              skeleton={<TableSkeleton rows={8} />}
-            >
-              {overview && overview.available && (
-                <>
-                  {tab === 'overview' && (
-                    <>
-                      <EfficiencyCards population={overview.population} />
-                      <div className={styles.effBar} role="group" aria-label="Fleet ratios">
-                        <div className={styles.effStat}>
-                          <div className={styles.effLabel}>CPU used / requested</div>
-                          <div className={styles.effValue}>{pct(eff?.cpuUsedRatio ?? 0)}</div>
-                        </div>
-                        <div className={styles.effStat}>
-                          <div className={styles.effLabel}>Mem used / requested</div>
-                          <div className={styles.effValue}>{pct(eff?.memUsedRatio ?? 0)}</div>
-                        </div>
-                        <div className={styles.effStat}>
-                          <div className={styles.effLabel}>CPU packing</div>
-                          <div className={styles.effValue}>
-                            {eff?.cpuAllocRatio != null ? pct(eff.cpuAllocRatio) : '—'}
-                          </div>
-                        </div>
-                        <div className={styles.effStat}>
-                          <div className={styles.effLabel}>Reclaimable / mo</div>
-                          <div className={styles.effValueGood}>{formatUsd(eff?.reclaimableMonthlyUsd ?? 0)}</div>
-                        </div>
-                        <div className={styles.effStat}>
-                          <div className={styles.effLabel}>Deficit / mo</div>
-                          <div className={styles.effValueWarn}>{formatUsd(eff?.deficitMonthlyUsd ?? 0)}</div>
-                        </div>
-                      </div>
-                      {eff?.ratesAreEstimates && (
-                        <p className={styles.rateNote}>
-                          USD figures are rate-based estimates (${eff.cpuHourUsd}/vCPU-hr, ${eff.memoryGibHourUsd}
-                          /GiB-hr), not cloud billing. Storage bands stay empty until filesystem series are scraped.
-                        </p>
-                      )}
-                      <div className={styles.tiles} role="group" aria-label="Gap counts">
-                        {gapTiles.map((t) => (
-                          <div key={t.label} className={styles.tile}>
-                            <div className={styles.tileValue}>{t.value}</div>
-                            <div className={styles.tileLabel}>{t.label}</div>
-                          </div>
+        {(tab === 'overview' || tab === 'namespaces' || tab === 'nodes') && (
+          <DataState
+            loading={overviewLoading}
+            error={overviewError}
+            empty={overview != null && !overview.available}
+            emptyTitle="Capacity metrics unavailable"
+            emptyMessage={
+              overview?.enablementNote ||
+              'Deploy kube-state-metrics and cAdvisor scrapes to Prometheus (Path A) or ClickHouse otel_metrics_* (Path B).'
+            }
+            skeleton={<TableSkeleton rows={8} />}
+          >
+            {overview && overview.available && (
+              <Stack direction="column" gap={3}>
+                {tab === 'overview' && (
+                  <>
+                    <EfficiencyCards population={overview.population} />
+
+                    <Stack direction="column" gap={1}>
+                      <div className={styles.statGrid} role="group" aria-label="Fleet ratios">
+                        {[
+                          { label: 'CPU used / requested', value: pct(eff?.cpuUsedRatio ?? 0) },
+                          { label: 'Mem used / requested', value: pct(eff?.memUsedRatio ?? 0) },
+                          {
+                            label: 'CPU packing',
+                            value: eff?.cpuAllocRatio != null ? pct(eff.cpuAllocRatio) : '—',
+                          },
+                          {
+                            label: 'Reclaimable / mo',
+                            value: formatUsd(eff?.reclaimableMonthlyUsd ?? 0),
+                            color: 'success' as const,
+                          },
+                          {
+                            label: 'Deficit / mo',
+                            value: formatUsd(eff?.deficitMonthlyUsd ?? 0),
+                            color: 'warning' as const,
+                          },
+                        ].map((s) => (
+                          <Box
+                            key={s.label}
+                            padding={1.5}
+                            backgroundColor="secondary"
+                            borderColor="weak"
+                            borderStyle="solid"
+                            borderRadius="default"
+                          >
+                            <Stack direction="column" gap={0.5}>
+                              <Text variant="bodySmall" color="secondary">
+                                {s.label}
+                              </Text>
+                              <Text variant="h4" color={s.color} tabular>
+                                {s.value}
+                              </Text>
+                            </Stack>
+                          </Box>
                         ))}
                       </div>
-                    </>
-                  )}
+                      {eff?.ratesAreEstimates && (
+                        <Text variant="bodySmall" color="secondary">
+                          USD figures are rate-based estimates (${eff.cpuHourUsd}/vCPU-hr, ${eff.memoryGibHourUsd}
+                          /GiB-hr), not cloud billing.
+                        </Text>
+                      )}
+                    </Stack>
 
-                  {(tab === 'overview' || tab === 'namespaces') && (
-                    <>
-                      <h3 className={styles.sectionTitle}>
+                    <div className={styles.tileGrid} role="group" aria-label="Gap counts">
+                      {gapTiles.map((t) => (
+                        <Box
+                          key={t.label}
+                          padding={1.5}
+                          backgroundColor="secondary"
+                          borderColor="weak"
+                          borderStyle="solid"
+                          borderRadius="default"
+                        >
+                          <Stack direction="column" gap={0.25} alignItems="center">
+                            <Text variant="h4" tabular>
+                              {t.value}
+                            </Text>
+                            <Text variant="bodySmall" color="secondary">
+                              {t.label}
+                            </Text>
+                          </Stack>
+                        </Box>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {(tab === 'overview' || tab === 'namespaces') && (
+                  <Box
+                    padding={2}
+                    backgroundColor="secondary"
+                    borderColor="weak"
+                    borderStyle="solid"
+                    borderRadius="default"
+                  >
+                    <Stack direction="column" gap={1.5}>
+                      <Text element="h3" variant="h5">
                         {tab === 'overview' ? 'Waste by namespace' : 'Namespaces'}
-                      </h3>
-                      <table className={styles.table} aria-label="Namespaces capacity">
-                        <thead>
-                          <tr>
-                            <th scope="col">Namespace</th>
-                            <th scope="col">CPU usage</th>
-                            <th scope="col">Mem usage</th>
-                            <th scope="col">Waste CPU</th>
-                            <th scope="col">Waste mem</th>
-                            <th scope="col">Gaps</th>
-                            <th scope="col">Predict</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {filteredNamespaces.map((ns) => (
-                            <tr key={`${ns.environment ?? ''}:${ns.namespace}`} className={styles.row}>
-                              <td
-                                className={styles.nameCell}
-                                onClick={() => {
-                                  const extra: Record<string, string> = {};
-                                  if (env) {
-                                    extra.environment = env;
-                                  }
-                                  appNavigate(`namespaces/${encodeURIComponent(ns.namespace)}`, extra);
-                                }}
-                              >
-                                {ns.namespace}
-                                {ns.environment ? <div className={styles.muted}>{ns.environment}</div> : null}
-                              </td>
-                              <td>{usageBar(ns.cpuUsedRatio, styles)}</td>
-                              <td>{usageBar(ns.memUsedRatio, styles)}</td>
-                              <td>{formatCores(ns.wasteCpu)}</td>
-                              <td>{formatBytes(ns.wasteMem)}</td>
-                              <td className={styles.muted}>
-                                {ns.missingRequest + ns.missingLimit + ns.underProvisioned + ns.throttled || '—'}
-                              </td>
-                              <td>
-                                <div className={styles.predictBtns}>
-                                  <Button
-                                    size="sm"
-                                    variant="secondary"
-                                    onClick={() => openPredict({ namespace: ns.namespace, resource: 'cpu' })}
-                                  >
-                                    Predict CPU
-                                  </Button>
-                                  <Button
-                                    size="sm"
-                                    variant="secondary"
-                                    onClick={() => openPredict({ namespace: ns.namespace, resource: 'memory' })}
-                                  >
-                                    Predict Mem
-                                  </Button>
-                                </div>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </>
-                  )}
+                      </Text>
+                      <InteractiveTable
+                        columns={nsColumns}
+                        data={filteredNamespaces}
+                        getRowId={(r) => `${r.environment ?? ''}:${r.namespace}`}
+                        pageSize={tab === 'overview' ? 10 : 15}
+                      />
+                    </Stack>
+                  </Box>
+                )}
 
-                  {tab === 'overview' && (
-                    <>
-                      <h3 className={styles.sectionTitle}>Top waste CPU</h3>
-                      <table className={styles.table} aria-label="Top waste CPU">
-                        <thead>
-                          <tr>
-                            <th scope="col">Namespace</th>
-                            <th scope="col">Pod</th>
-                            <th scope="col">Container</th>
-                            <th scope="col">Waste</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {(overview.topWasteCpu ?? []).map((r, i) => (
-                            <tr key={`${r.namespace}-${r.pod}-${r.container}-${i}`}>
-                              <td>{r.namespace}</td>
-                              <td>{r.pod}</td>
-                              <td>{r.container}</td>
-                              <td>{formatCores(r.wasteCpu ?? 0)}</td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </>
-                  )}
+                {tab === 'overview' && (
+                  <Box
+                    padding={2}
+                    backgroundColor="secondary"
+                    borderColor="weak"
+                    borderStyle="solid"
+                    borderRadius="default"
+                  >
+                    <Stack direction="column" gap={1.5}>
+                      <Text element="h3" variant="h5">
+                        Top waste CPU
+                      </Text>
+                      <InteractiveTable
+                        columns={wasteColumns}
+                        data={topWasteCpu}
+                        getRowId={(r, i) => `${r.namespace}-${r.pod ?? ''}-${r.container}-${i}`}
+                        pageSize={10}
+                      />
+                    </Stack>
+                  </Box>
+                )}
 
-                  {tab === 'nodes' && (
-                    <>
-                      <h3 className={styles.sectionTitle}>Nodes</h3>
+                {tab === 'nodes' && (
+                  <Box
+                    padding={2}
+                    backgroundColor="secondary"
+                    borderColor="weak"
+                    borderStyle="solid"
+                    borderRadius="default"
+                  >
+                    <Stack direction="column" gap={1.5}>
+                      <Text element="h3" variant="h5">
+                        Nodes
+                      </Text>
                       {nodes.length === 0 ? (
                         <Alert severity="info" title="No node series">
-                          Node rows need cAdvisor usage joined to kube_node_status_allocatable. Storage stays No data
-                          until filesystem series are scraped.
+                          Node rows need cAdvisor usage joined to kube_node_status_allocatable.
                         </Alert>
                       ) : (
-                        <table className={styles.table} aria-label="Nodes capacity">
-                          <thead>
-                            <tr>
-                              <th scope="col" />
-                              <th scope="col">Node</th>
-                              <th scope="col">CPU</th>
-                              <th scope="col">Memory</th>
-                              <th scope="col">Storage</th>
-                              <th scope="col">Ready</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {nodes.map((n) => {
-                              const open = expandedNode === n.node;
-                              return (
-                                <React.Fragment key={n.node}>
-                                  <tr className={styles.row}>
-                                    <td>
-                                      <Button
-                                        size="sm"
-                                        variant="secondary"
-                                        icon={open ? 'angle-down' : 'angle-right'}
-                                        aria-label={open ? 'Collapse' : 'Expand'}
-                                        onClick={() => setExpandedNode(open ? null : n.node)}
-                                      />
-                                    </td>
-                                    <td className={styles.nameCell}>
-                                      {n.node}
-                                      {n.environment ? <div className={styles.muted}>{n.environment}</div> : null}
-                                    </td>
-                                    <td>{usageBar(n.cpuUsedRatio, styles)}</td>
-                                    <td>{usageBar(n.memUsedRatio, styles)}</td>
-                                    <td>
-                                      {n.storageRatio != null ? (
-                                        usageBar(n.storageRatio, styles)
-                                      ) : (
-                                        <span className={styles.muted}>No data</span>
-                                      )}
-                                    </td>
-                                    <td>
-                                      <Badge
-                                        text={n.conditionReady ? 'Ready' : 'NotReady'}
-                                        color={n.conditionReady ? 'green' : 'red'}
-                                      />
-                                    </td>
-                                  </tr>
-                                  {open && (
-                                    <tr>
-                                      <td colSpan={6}>
-                                        <div className={styles.expandRow}>
-                                          <span className={styles.muted}>
-                                            CPU {formatCores(n.cpuUsage)} / {formatCores(n.cpuAlloc)} · Mem{' '}
-                                            {formatBytes(n.memUsage)} / {formatBytes(n.memAlloc)}
-                                            {n.podCount != null ? ` · ${n.podCount} pods` : ''}
-                                          </span>
-                                          <div className={styles.predictBtns}>
-                                            <Button
-                                              size="sm"
-                                              variant="secondary"
-                                              onClick={() =>
-                                                openPredict({
-                                                  namespace: nsFilter || filteredNamespaces[0]?.namespace || 'default',
-                                                  resource: 'cpu',
-                                                  node: n.node,
-                                                })
-                                              }
-                                            >
-                                              Predict CPU Usage
-                                            </Button>
-                                            <Button
-                                              size="sm"
-                                              variant="secondary"
-                                              onClick={() =>
-                                                openPredict({
-                                                  namespace: nsFilter || filteredNamespaces[0]?.namespace || 'default',
-                                                  resource: 'memory',
-                                                  node: n.node,
-                                                })
-                                              }
-                                            >
-                                              Predict Mem Usage
-                                            </Button>
-                                          </div>
-                                        </div>
-                                      </td>
-                                    </tr>
+                        <InteractiveTable
+                          columns={nodeColumns}
+                          data={nodes}
+                          getRowId={(r) => r.node}
+                          renderExpandedRow={(n) => (
+                            <Box padding={1.5} backgroundColor="canvas" borderRadius="default">
+                              <Stack
+                                direction="row"
+                                justifyContent="space-between"
+                                alignItems="center"
+                                wrap="wrap"
+                                gap={2}
+                              >
+                                <Stack direction="row" gap={3} wrap="wrap">
+                                  <Text variant="bodySmall" color="secondary" tabular>
+                                    CPU: {formatCores(n.cpuUsage)} / {formatCores(n.cpuAlloc)}
+                                  </Text>
+                                  <Text variant="bodySmall" color="secondary" tabular>
+                                    Memory: {formatBytes(n.memUsage)} / {formatBytes(n.memAlloc)}
+                                  </Text>
+                                  {n.storageUsage != null && n.storageLimit != null && (
+                                    <Text variant="bodySmall" color="secondary" tabular>
+                                      Storage: {formatBytes(n.storageUsage)} / {formatBytes(n.storageLimit)}
+                                    </Text>
                                   )}
-                                </React.Fragment>
-                              );
-                            })}
-                          </tbody>
-                        </table>
+                                  {n.podCount != null && n.podCount > 0 && (
+                                    <Text variant="bodySmall" color="secondary" tabular>
+                                      Pods: {n.podCount}
+                                    </Text>
+                                  )}
+                                </Stack>
+                                <Stack direction="row" gap={1}>
+                                  <Button
+                                    size="sm"
+                                    variant="secondary"
+                                    onClick={() =>
+                                      setPredict({
+                                        namespace: nsFilter || filteredNamespaces[0]?.namespace || 'default',
+                                        resource: 'cpu',
+                                        node: n.node,
+                                      })
+                                    }
+                                  >
+                                    Predict CPU Usage
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="secondary"
+                                    onClick={() =>
+                                      setPredict({
+                                        namespace: nsFilter || filteredNamespaces[0]?.namespace || 'default',
+                                        resource: 'memory',
+                                        node: n.node,
+                                      })
+                                    }
+                                  >
+                                    Predict Mem Usage
+                                  </Button>
+                                </Stack>
+                              </Stack>
+                            </Box>
+                          )}
+                        />
                       )}
-                    </>
-                  )}
-                </>
-              )}
-            </DataState>
-          )}
+                    </Stack>
+                  </Box>
+                )}
+              </Stack>
+            )}
+          </DataState>
+        )}
 
-          {tab === 'rightsizing' && (
-            <DataState
-              loading={recsLoading}
-              error={recsError}
-              empty={recs != null && !recs.available}
-              emptyTitle="No recommendations"
-              emptyMessage={recs?.enablementNote || 'Need container metrics for this filter.'}
-              skeleton={<TableSkeleton rows={8} />}
-            >
-              {recs && recs.available && (
-                <table className={styles.table} aria-label="Right-sizing recommendations">
-                  <thead>
-                    <tr>
-                      <th scope="col">Workload</th>
-                      <th scope="col">Container</th>
-                      <th scope="col">QoS</th>
-                      <th scope="col">Confidence</th>
-                      <th scope="col">Reclaimable</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {recs.recommendations.map((r) => (
-                      <tr
-                        key={`${r.namespace}-${r.workloadName}-${r.container}`}
-                        className={styles.row}
-                        onClick={() => setSelectedRec(r)}
-                      >
-                        <td className={styles.nameCell}>
-                          {r.workloadKind}/{r.workloadName}
-                          <div className={styles.muted}>{r.namespace}</div>
-                        </td>
-                        <td>{r.container}</td>
-                        <td>{r.qosClass}</td>
-                        <td>
-                          <Badge text={r.confidence} color={r.confidence === 'high' ? 'green' : 'orange'} />
-                        </td>
-                        <td>{formatUsd(r.reclaimableMonthlyUsd)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
-              {selectedRec && (
-                <Drawer
-                  title={`${selectedRec.workloadName} / ${selectedRec.container}`}
-                  onClose={() => setSelectedRec(null)}
-                >
+        {tab === 'rightsizing' && (
+          <DataState
+            loading={recsLoading}
+            error={recsError}
+            empty={recs != null && !recs.available}
+            emptyTitle="No recommendations"
+            emptyMessage={recs?.enablementNote || 'Need container metrics for this filter.'}
+            skeleton={<TableSkeleton rows={8} />}
+          >
+            {recs && recs.available && (
+              <Box
+                padding={2}
+                backgroundColor="secondary"
+                borderColor="weak"
+                borderStyle="solid"
+                borderRadius="default"
+              >
+                <InteractiveTable
+                  columns={recColumns}
+                  data={recommendations}
+                  getRowId={(r) => `${r.namespace}-${r.workloadName}-${r.container}`}
+                  pageSize={15}
+                />
+              </Box>
+            )}
+            {selectedRec && (
+              <Drawer
+                title={`${selectedRec.workloadName} / ${selectedRec.container}`}
+                onClose={() => setSelectedRec(null)}
+              >
+                <Stack direction="column" gap={2}>
                   <TextArea value={selectedRec.yamlPatch} readOnly rows={16} />
-                  <div className={styles.drawerActions}>
+                  <Stack direction="row" gap={1}>
                     <Button
                       onClick={() => {
                         void navigator.clipboard.writeText(selectedRec.yamlPatch);
@@ -592,12 +779,12 @@ function Capacity() {
                     >
                       Open service
                     </Button>
-                  </div>
-                </Drawer>
-              )}
-            </DataState>
-          )}
-        </div>
+                  </Stack>
+                </Stack>
+              </Drawer>
+            )}
+          </DataState>
+        )}
 
         {predict && (
           <Drawer
@@ -605,272 +792,120 @@ function Capacity() {
             onClose={() => setPredict(null)}
             size="lg"
           >
-            <div className={styles.predictFilters}>
-              <Combobox
-                options={nsOptions.filter((o) => o.value)}
-                value={predict.namespace}
-                onChange={(v) => {
-                  if (v?.value) {
-                    setPredict({ ...predict, namespace: v.value });
+            <Stack direction="column" gap={2}>
+              <Stack direction="row" gap={2} alignItems="center" wrap="wrap">
+                <InlineField label="Namespace" noMargin>
+                  <Combobox
+                    options={nsOptions.filter((o) => o.value)}
+                    value={predict.namespace}
+                    onChange={(v) => {
+                      if (v?.value) {
+                        setPredict({ ...predict, namespace: v.value });
+                      }
+                    }}
+                    placeholder="Namespace"
+                    width={28}
+                  />
+                </InlineField>
+                <RadioButtonGroup
+                  options={FORECAST_RESOURCE_OPTIONS}
+                  value={predict.resource}
+                  onChange={(v) => setPredict({ ...predict, resource: v })}
+                />
+              </Stack>
+
+              {toMs - fromMs < 2 * 60 * 60 * 1000 ? (
+                <Alert severity="info" title="Widen the time range">
+                  Predict needs at least 2 hours of history.
+                </Alert>
+              ) : (
+                <DataState
+                  loading={historyLoading || forecastLoading}
+                  error={historyError || forecastError}
+                  empty={
+                    (history != null && !history.available && forecast != null && !forecast.available) ||
+                    (forecast != null && !forecast.available && !forecastLoading)
                   }
-                }}
-                placeholder="Namespace"
-                width={28}
-              />
-              <RadioButtonGroup
-                options={FORECAST_RESOURCE_OPTIONS}
-                value={predict.resource}
-                onChange={(v) => setPredict({ ...predict, resource: v })}
-              />
-            </div>
-            {toMs - fromMs < 2 * 60 * 60 * 1000 ? (
-              <Alert severity="info" title="Widen the time range">
-                Predict needs at least 2 hours of history.
-              </Alert>
-            ) : (
-              <DataState
-                loading={historyLoading || forecastLoading}
-                error={historyError || forecastError}
-                empty={
-                  (history != null && !history.available && forecast != null && !forecast.available) ||
-                  (forecast != null && !forecast.available && !forecastLoading)
-                }
-                emptyTitle="No predict data"
-                emptyMessage={forecast?.enablementNote || history?.enablementNote}
-                skeleton={<TableSkeleton rows={4} />}
-              >
-                {forecast?.available && (
-                  <>
-                    <p className={styles.rateNote}>
-                      Method: {forecast.methodLabel} ({forecast.method}). Not a billing forecast.
-                    </p>
-                    <div className={styles.predictBtns}>
-                      {forecast.daysToRequest != null && (
-                        <Badge text={`~${forecast.daysToRequest.toFixed(1)}d to request`} color="orange" />
-                      )}
-                      {forecast.daysToLimit != null && (
-                        <Badge text={`~${forecast.daysToLimit.toFixed(1)}d to limit`} color="red" />
-                      )}
-                    </div>
-                    <table className={styles.table} aria-label="Capacity forecast">
-                      <thead>
-                        <tr>
-                          <th scope="col">Series</th>
-                          <th scope="col">Points</th>
-                          <th scope="col">Latest</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {forecast.series.map((s) => (
-                          <tr key={s.name}>
-                            <td>{s.name}</td>
-                            <td>{s.points.length}</td>
-                            <td>
-                              {s.points.length
-                                ? forecast.resource === 'memory'
-                                  ? formatBytes(s.points[s.points.length - 1].value)
-                                  : formatCores(s.points[s.points.length - 1].value)
-                                : '—'}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </>
-                )}
-                {history?.available && (
-                  <>
-                    <h3 className={styles.sectionTitle}>History</h3>
-                    {history.note && <p className={styles.rateNote}>{history.note}</p>}
-                    <table className={styles.table} aria-label="Capacity history">
-                      <thead>
-                        <tr>
-                          <th scope="col">Series</th>
-                          <th scope="col">Points</th>
-                          <th scope="col">Latest</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {history.series.map((s) => (
-                          <tr key={s.name}>
-                            <td>{s.name}</td>
-                            <td>{s.points.length}</td>
-                            <td>{s.points.length ? s.points[s.points.length - 1].value.toFixed(4) : '—'}</td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </>
-                )}
-              </DataState>
-            )}
+                  emptyTitle="No predict data"
+                  emptyMessage={forecast?.enablementNote || history?.enablementNote}
+                  skeleton={<TableSkeleton rows={4} />}
+                >
+                  <Stack direction="column" gap={2}>
+                    {forecast?.available && (
+                      <>
+                        <Stack direction="row" gap={1} alignItems="center" wrap="wrap">
+                          <Text variant="bodySmall" color="secondary">
+                            Method: {forecast.methodLabel} ({forecast.method}). Not a billing forecast.
+                          </Text>
+                          {forecast.daysToRequest != null && (
+                            <Badge text={`~${forecast.daysToRequest.toFixed(1)}d to request`} color="orange" />
+                          )}
+                          {forecast.daysToLimit != null && (
+                            <Badge text={`~${forecast.daysToLimit.toFixed(1)}d to limit`} color="red" />
+                          )}
+                        </Stack>
+                        <Box
+                          padding={1.5}
+                          backgroundColor="secondary"
+                          borderColor="weak"
+                          borderStyle="solid"
+                          borderRadius="default"
+                        >
+                          <PredictChartPanel
+                            title={`${predict.resource.toUpperCase()} usage & linear projection`}
+                            series={forecast.series}
+                            unit={predict.resource === 'memory' ? 'bytes' : 'short'}
+                            fromMs={fromMs}
+                            toMs={toMs}
+                          />
+                        </Box>
+                      </>
+                    )}
+                    {history?.available && (
+                      <Box
+                        padding={1.5}
+                        backgroundColor="secondary"
+                        borderColor="weak"
+                        borderStyle="solid"
+                        borderRadius="default"
+                      >
+                        <Stack direction="column" gap={1}>
+                          <PredictChartPanel
+                            title="Historical usage vs request / limit"
+                            series={historyForResource}
+                            unit={predict.resource === 'memory' ? 'bytes' : 'short'}
+                            fromMs={fromMs}
+                            toMs={toMs}
+                          />
+                          {history.note && (
+                            <Text variant="bodySmall" color="secondary">
+                              {history.note}
+                            </Text>
+                          )}
+                        </Stack>
+                      </Box>
+                    )}
+                  </Stack>
+                </DataState>
+              )}
+            </Stack>
           </Drawer>
         )}
-      </div>
+      </Stack>
     </PluginPage>
   );
 }
 
 const getStyles = (theme: GrafanaTheme2) => ({
-  container: css`
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    padding: 0;
-    overflow: hidden;
+  statGrid: css`
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: ${theme.spacing(1.5)};
   `,
-  toolbar: css`
-    display: flex;
-    flex-direction: column;
-    gap: ${theme.spacing(1)};
-    margin-bottom: ${theme.spacing(1)};
-    z-index: 2;
-  `,
-  scopeRow: css`
-    display: flex;
-    gap: ${theme.spacing(1)};
-    align-items: center;
-  `,
-  filterGroup: css`
-    display: flex;
-    flex: 1;
-    gap: ${theme.spacing(1)};
-    align-items: center;
-    min-width: 0;
-  `,
-  filterItem: css`
-    flex: 1;
-    min-width: 160px;
-    max-width: 320px;
-  `,
-  tabContent: css`
-    margin-top: ${theme.spacing(2)};
-  `,
-  effBar: css`
-    display: flex;
-    flex-wrap: wrap;
-    gap: ${theme.spacing(1)};
-    margin-bottom: ${theme.spacing(2)};
-  `,
-  effStat: css`
-    background: ${theme.colors.background.secondary};
-    border: 1px solid ${theme.colors.border.weak};
-    border-radius: ${theme.shape.radius.default};
-    padding: ${theme.spacing(1.5)} ${theme.spacing(2)};
-    min-width: 120px;
-  `,
-  effLabel: css`
-    color: ${theme.colors.text.secondary};
-    font-size: ${typographyFontSize(theme, 'sm')};
-  `,
-  effValue: css`
-    font-size: ${typographyFontSize(theme, 'md')};
-    font-weight: ${theme.typography.fontWeightMedium};
-    font-variant-numeric: tabular-nums;
-  `,
-  effValueGood: css`
-    font-size: ${typographyFontSize(theme, 'md')};
-    font-weight: ${theme.typography.fontWeightMedium};
-    font-variant-numeric: tabular-nums;
-    color: ${theme.colors.success.text};
-  `,
-  effValueWarn: css`
-    font-size: ${typographyFontSize(theme, 'md')};
-    font-weight: ${theme.typography.fontWeightMedium};
-    font-variant-numeric: tabular-nums;
-    color: ${theme.colors.warning.text};
-  `,
-  rateNote: css`
-    color: ${theme.colors.text.secondary};
-    font-size: ${typographyFontSize(theme, 'sm')};
-    margin: 0 0 ${theme.spacing(2)};
-  `,
-  tiles: css`
-    display: flex;
-    flex-wrap: wrap;
-    gap: ${theme.spacing(1)};
-    margin-bottom: ${theme.spacing(3)};
-  `,
-  tile: css`
-    background: ${theme.colors.background.secondary};
-    border: 1px solid ${theme.colors.border.weak};
-    border-radius: ${theme.shape.radius.default};
-    padding: ${theme.spacing(1.5)};
-    min-width: 110px;
-    text-align: center;
-  `,
-  tileValue: css`
-    font-size: ${typographyFontSize(theme, 'md')};
-    font-weight: ${theme.typography.fontWeightMedium};
-    font-variant-numeric: tabular-nums;
-  `,
-  tileLabel: css`
-    color: ${theme.colors.text.secondary};
-    font-size: ${typographyFontSize(theme, 'sm')};
-  `,
-  sectionTitle: css`
-    margin: ${theme.spacing(3)} 0 ${theme.spacing(1)};
-    font-size: ${typographyFontSize(theme, 'base')};
-    font-weight: ${theme.typography.fontWeightMedium};
-  `,
-  table: css`
-    width: 100%;
-    border-collapse: separate;
-    border-spacing: 0;
-    th {
-      text-align: left;
-      padding: ${theme.spacing(1)} ${theme.spacing(1.5)};
-      color: ${theme.colors.text.secondary};
-      font-size: ${typographyFontSize(theme, 'sm')};
-      font-weight: ${theme.typography.fontWeightMedium};
-      border-bottom: 1px solid ${theme.colors.border.medium};
-      white-space: nowrap;
-    }
-    td {
-      padding: ${theme.spacing(1)} ${theme.spacing(1.5)};
-      border-bottom: 1px solid ${theme.colors.border.weak};
-      vertical-align: middle;
-    }
-  `,
-  row: css`
-    cursor: pointer;
-    &:hover {
-      background: ${theme.colors.background.secondary};
-    }
-  `,
-  nameCell: css`
-    font-weight: ${theme.typography.fontWeightMedium};
-    color: ${theme.colors.text.primary};
-  `,
-  muted: css`
-    color: ${theme.colors.text.secondary};
-    font-size: ${typographyFontSize(theme, 'sm')};
-  `,
-  drawerActions: css`
-    margin-top: ${theme.spacing(2)};
-    display: flex;
-    gap: ${theme.spacing(1)};
-    flex-wrap: wrap;
-  `,
-  predictBtns: css`
-    display: flex;
-    gap: ${theme.spacing(0.5)};
-    flex-wrap: wrap;
-  `,
-  predictFilters: css`
-    display: flex;
-    gap: ${theme.spacing(1)};
-    align-items: center;
-    margin-bottom: ${theme.spacing(2)};
-    flex-wrap: wrap;
-  `,
-  expandRow: css`
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: ${theme.spacing(2)};
-    padding: ${theme.spacing(1)} 0;
-    flex-wrap: wrap;
+  tileGrid: css`
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+    gap: ${theme.spacing(1.5)};
   `,
   usageCell: css`
     display: flex;
@@ -896,11 +931,6 @@ const getStyles = (theme: GrafanaTheme2) => ({
   `,
   barOver: css`
     background: ${theme.colors.error.main};
-  `,
-  usagePct: css`
-    font-variant-numeric: tabular-nums;
-    font-size: ${typographyFontSize(theme, 'sm')};
-    min-width: 2.5rem;
   `,
 });
 

@@ -9,6 +9,17 @@ jest.mock('@grafana/runtime', () => ({
   locationService: { getLocation: () => ({ search: '' }) },
 }));
 
+jest.mock('@grafana/scenes', () => {
+  const panel = () => ({ setTitle: () => panel(), setUnit: () => panel(), build: () => ({}) });
+  return {
+    EmbeddedScene: jest.fn().mockImplementation((cfg: unknown) => ({ ...(cfg as object), Component: () => null })),
+    SceneDataNode: jest.fn().mockImplementation(() => ({ setState: jest.fn() })),
+    SceneFlexLayout: jest.fn(),
+    SceneFlexItem: jest.fn(),
+    PanelBuilders: { timeseries: panel },
+  };
+});
+
 jest.mock('../components/HeaderTimeControls', () => ({
   HeaderTimeControls: () => <div data-testid="time-controls" />,
 }));
