@@ -1,6 +1,7 @@
 package chquery
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,113 @@ func TestCapacityRecsBucketSQL_AndHistory(t *testing.T) {
 		if !strings.Contains(hist, want) {
 			t.Errorf("history SQL missing %q", want)
 		}
+	}
+}
+
+func TestCapacityResetAwareIncrease(t *testing.T) {
+	cases := []struct {
+		name      string
+		prev, cur float64
+		hasPrev   bool
+		want      float64
+	}{
+		{"no previous sample is zero", 0, 1000, false, 0},
+		{"monotonic step", 1000, 1010, true, 10},
+		{"reset adds current value", 1010, 0, true, 0},
+		{"first sample after reset", 0, 10, true, 10},
+		{"flat sample adds nothing", 42, 42, true, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := capacityResetAwareIncrease(tc.prev, tc.cur, tc.hasPrev); got != tc.want {
+				t.Fatalf("got %v want %v", got, tc.want)
+			}
+		})
+	}
+
+	series := []float64{1000, 1010, 0, 10}
+	var total float64
+	for i, v := range series {
+		hasPrev := i > 0
+		var prev float64
+		if hasPrev {
+			prev = series[i-1]
+		}
+		total += capacityResetAwareIncrease(prev, v, hasPrev)
+	}
+	if total != 20 {
+		t.Fatalf("series total = %v, want 20", total)
+	}
+}
+
+func TestCapacityCounterSQL_UsesResetAwareLagNotExtrema(t *testing.T) {
+	to := time.Unix(1_700_000_000, 0).UTC()
+	from := to.Add(-5 * time.Minute)
+	cpu := q(MetricContainerCPUUsage)
+	thr := q(MetricContainerCPUThrottled)
+
+	ledger := CapacityLedgerSQL("demo", "prod", from, to)
+	for _, old := range []string{
+		fmt.Sprintf("maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s)", cpu, cpu),
+		fmt.Sprintf("maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s)", thr, thr),
+	} {
+		if strings.Contains(ledger, old) {
+			t.Errorf("ledger still uses extrema for counters: %s", old)
+		}
+	}
+	for _, want := range []string{"lagInFrame(Value, 1, nan)", "isNaN(prev_val)", "/ 300"} {
+		if !strings.Contains(ledger, want) {
+			t.Errorf("ledger missing %q\n%s", want, ledger)
+		}
+	}
+
+	recs := CapacityRecsBucketSQL("demo", "prod", from, to)
+	if strings.Contains(recs, fmt.Sprintf("maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s)", cpu, cpu)) {
+		t.Error("recs still uses extrema for cpu counter")
+	}
+	for _, want := range []string{"lagInFrame(Value, 1, nan)", "isNaN(prev_val)", "AS cpu_rate", "AS thr_rate"} {
+		if !strings.Contains(recs, want) {
+			t.Errorf("recs missing %q\n%s", want, recs)
+		}
+	}
+
+	hist := CapacityHistorySeriesSQL("demo", "", "", "", from, to, 60)
+	if strings.Contains(hist, "max(Value) - min(Value)") {
+		t.Error("history still uses extrema for counter delta")
+	}
+	for _, want := range []string{"lagInFrame(Value, 1, nan)", "isNaN(prev_val)", "AS inc", "AS dt"} {
+		if !strings.Contains(hist, want) {
+			t.Errorf("history missing %q\n%s", want, hist)
+		}
+	}
+}
+
+func TestCapacityHistorySeriesSQL_ReadsPrecedingSample(t *testing.T) {
+	to := time.Unix(1_700_000_000, 0).UTC()
+	from := to.Add(-time.Hour)
+	step := 60
+	hist := CapacityHistorySeriesSQL("demo", "", "", "", from, to, step)
+
+	precedingFrom := from.Add(-time.Duration(step) * time.Second)
+	scanFrom := fmt.Sprintf(
+		"%s >= fromUnixTimestamp64Milli(%d) AND %s <= fromUnixTimestamp64Milli(%d)",
+		ColTimeUnix, precedingFrom.UnixMilli(), ColTimeUnix, to.UnixMilli(),
+	)
+	if !strings.Contains(hist, scanFrom) {
+		t.Fatalf("history must scan one step before from to keep a preceding sample\nwant %s\n%s", scanFrom, hist)
+	}
+	inRange := fmt.Sprintf("%s >= fromUnixTimestamp64Milli(%d)", ColTimeUnix, from.UnixMilli())
+	if !strings.Contains(hist, inRange) {
+		t.Errorf("history must attribute increases only at or after from (%s)", inRange)
+	}
+	if !strings.Contains(hist, "sumIf(dt, MetricName") {
+		t.Errorf("history rates must divide by elapsed sample time\n%s", hist)
+	}
+	if !strings.Contains(hist, "sum(in_range) > 0") {
+		t.Error("history must drop buckets holding only the preceding baseline sample")
+	}
+	if strings.Contains(hist, "max(Value) - min(Value)") {
+		t.Error("history must not derive counter increases from extrema")
 	}
 }
 
