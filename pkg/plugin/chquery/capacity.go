@@ -107,7 +107,32 @@ func capacityEnvFilter(env string) string {
 	if env == "" {
 		return "1"
 	}
-	return fmt.Sprintf("(%s = %s)", capacityClusterExpr(), q(env))
+	envs := strings.Split(env, ",")
+	quoted := make([]string, 0, len(envs))
+	for _, e := range envs {
+		e = strings.TrimSpace(e)
+		if e != "" {
+			quoted = append(quoted, q(e))
+		}
+	}
+	switch len(quoted) {
+	case 0:
+		return "1"
+	case 1:
+		return fmt.Sprintf("(%s = %s)", capacityClusterExpr(), quoted[0])
+	default:
+		return fmt.Sprintf("(%s IN (%s))", capacityClusterExpr(), strings.Join(quoted, ", "))
+	}
+}
+
+// capacityPodWorkloadFilter scopes pods to a workload name (Deployment RS suffix,
+// StatefulSet ordinal, or exact pod name). Empty workload = no filter.
+func capacityPodWorkloadFilter(workload string) string {
+	if workload == "" {
+		return "1"
+	}
+	pod := capacityPodExpr()
+	return fmt.Sprintf("(%s = %s OR startsWith(%s, %s))", pod, q(workload), pod, q(workload+"-"))
 }
 
 func capacityContainerExclude() string {
@@ -230,8 +255,7 @@ FROM (
     AND %s AND (%s) AND (%s) AND (%s)
 )
 GROUP BY namespace, pod, container, k8s_cluster_name, node
-HAVING container != '' AND container != 'POD'
-LIMIT 10000`,
+HAVING container != '' AND container != 'POD'`,
 		q(MetricContainerCPUUsage), q(MetricContainerCPUUsage), win,
 		q(MetricContainerMemoryWorkingSet),
 		q(MetricKubePodResourceRequests),
@@ -262,23 +286,26 @@ func CapacityNodeAllocSQL(env string, from, to time.Time) string {
 	return fmt.Sprintf(`
 SELECT
   node,
+  k8s_cluster_name,
   sumIf(v, resource = 'cpu') AS alloc_cpu,
   sumIf(v, resource = 'memory') AS alloc_mem
 FROM (
   SELECT
     Attributes['resource'] AS resource,
     %s AS node,
+    %s AS k8s_cluster_name,
     argMax(Value, TimeUnix) AS v
   FROM %s
   WHERE MetricName = %s
     AND %s
     AND (%s)
-  GROUP BY resource, node
+  GROUP BY resource, node, k8s_cluster_name
 )
 WHERE node != ''
-GROUP BY node
+GROUP BY node, k8s_cluster_name
 LIMIT 500`,
 		capacityNodeExpr(),
+		capacityClusterExpr(),
 		table(queries.CHTableMetricsGauge),
 		q(MetricKubeNodeAllocatable),
 		MetricTimeFilter(from, to),
@@ -330,14 +357,16 @@ FROM (
   SELECT
     Attributes['resource'] AS resource,
     coalesce(nullIf(Attributes['node'], ''), nullIf(ResourceAttributes['k8s.node.name'], ''), '') AS node,
+    %s AS k8s_cluster_name,
     argMax(Value, TimeUnix) AS v
   FROM %s
   WHERE MetricName = %s
     AND %s
     AND (%s)
-  GROUP BY resource, node
+  GROUP BY resource, node, k8s_cluster_name
 )
 LIMIT 1`,
+		capacityClusterExpr(),
 		table(queries.CHTableMetricsGauge),
 		q(MetricKubeNodeAllocatable),
 		MetricTimeFilter(from, to),
@@ -396,12 +425,12 @@ SELECT
   quantileExact(0.95)(cpu_rate) AS cpu_p95,
   max(cpu_rate) AS cpu_max,
   quantileExact(0.95)(mem_val) AS mem_p95,
-  max(mem_val) AS mem_max,
+  max(mem_max) AS mem_max,
   max(thr_rate) AS thr_rate,
-  max(req_cpu) AS req_cpu,
-  max(req_mem) AS req_mem,
-  max(lim_cpu) AS lim_cpu,
-  max(lim_mem) AS lim_mem
+  argMax(req_cpu, bucket) AS req_cpu,
+  argMax(req_mem, bucket) AS req_mem,
+  argMax(lim_cpu, bucket) AS lim_cpu,
+  argMax(lim_mem, bucket) AS lim_mem
 FROM (
   SELECT
     namespace,
@@ -411,6 +440,7 @@ FROM (
     bucket,
     greatest(maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s), 0) / %d AS cpu_rate,
     argMaxIf(Value, TimeUnix, MetricName = %s) AS mem_val,
+    maxIf(Value, MetricName = %s) AS mem_max,
     greatest(maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s), 0) / %d AS thr_rate,
     argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS req_cpu,
     argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'memory') AS req_mem,
@@ -452,6 +482,7 @@ GROUP BY namespace, pod, container, k8s_cluster_name
 LIMIT 5000`,
 		q(MetricContainerCPUUsage), q(MetricContainerCPUUsage), bucket,
 		q(MetricContainerMemoryWorkingSet),
+		q(MetricContainerMemoryWorkingSet),
 		q(MetricContainerCPUThrottled), q(MetricContainerCPUThrottled), bucket,
 		q(MetricKubePodResourceRequests),
 		q(MetricKubePodResourceRequests),
@@ -469,13 +500,17 @@ LIMIT 5000`,
 }
 
 // CapacityHistorySeriesSQL returns bucketed fleet aggregates for one namespace.
-func CapacityHistorySeriesSQL(namespace, container, env string, from, to time.Time, stepSec int) string {
+// Optional workload scopes pods (prefix/exact match). Cluster is kept in the
+// inner GROUP BY so multi-cluster series stay independent until the outer sum.
+func CapacityHistorySeriesSQL(namespace, container, env, workload string, from, to time.Time, stepSec int) string {
 	if stepSec < 15 {
 		stepSec = 15
 	}
+	wl := workload
 	tf := MetricTimeFilter(from, to)
 	nsF := capacityNamespaceFilter(namespace)
 	envF := capacityEnvFilter(env)
+	wlF := capacityPodWorkloadFilter(wl)
 	ctrF := "1"
 	if container != "" {
 		ctrF = fmt.Sprintf("(%s = %s)", capacityContainerExpr(), q(container))
@@ -484,6 +519,7 @@ func CapacityHistorySeriesSQL(namespace, container, env string, from, to time.Ti
 	nsE := capacityNamespaceExpr()
 	podE := capacityPodExpr()
 	ctrE := capacityContainerExpr()
+	clE := capacityClusterExpr()
 
 	return fmt.Sprintf(`
 SELECT
@@ -504,20 +540,21 @@ FROM (
     %s AS namespace,
     %s AS pod,
     %s AS container,
+    %s AS k8s_cluster_name,
     greatest(max(Value) - min(Value), 0) AS delta,
     argMax(Value, TimeUnix) AS latest
   FROM (
     SELECT TimeUnix, MetricName, Value, Attributes, ResourceAttributes
     FROM %s
     WHERE MetricName IN (%s, %s, %s)
-      AND %s AND (%s) AND (%s) AND (%s) AND (%s)
+      AND %s AND (%s) AND (%s) AND (%s) AND (%s) AND (%s)
     UNION ALL
     SELECT TimeUnix, MetricName, Value, Attributes, ResourceAttributes
     FROM %s
     WHERE MetricName IN (%s, %s, %s)
-      AND %s AND (%s) AND (%s) AND (%s) AND (%s)
+      AND %s AND (%s) AND (%s) AND (%s) AND (%s) AND (%s)
   )
-  GROUP BY bucket_ms, MetricName, resource, namespace, pod, container
+  GROUP BY bucket_ms, MetricName, resource, namespace, pod, container, k8s_cluster_name
   HAVING container != '' AND container != 'POD'
 )
 GROUP BY bucket_ms
@@ -532,13 +569,13 @@ LIMIT 5000`,
 		q(MetricContainerCPUThrottled), stepSec,
 		q(MetricKubePodRestarts),
 		stepSec,
-		nsE, podE, ctrE,
+		nsE, podE, ctrE, clE,
 		table(queries.CHTableMetricsSum),
 		q(MetricContainerCPUUsage), q(MetricContainerCPUThrottled), q(MetricKubePodRestarts),
-		tf, nsF, envF, ctrF, ctrX,
+		tf, nsF, envF, ctrF, ctrX, wlF,
 		table(queries.CHTableMetricsGauge),
 		q(MetricContainerMemoryWorkingSet), q(MetricKubePodResourceRequests), q(MetricKubePodResourceLimits),
-		tf, nsF, envF, ctrF, ctrX,
+		tf, nsF, envF, ctrF, ctrX, wlF,
 	)
 }
 
@@ -822,6 +859,9 @@ func MergeNodeAllocIntoResultMap(rm map[string][]queries.PromResult, rows []map[
 			continue
 		}
 		labels := map[string]string{"node": node}
+		if cluster := ParseString(r["k8s_cluster_name"]); cluster != "" {
+			labels["k8s_cluster_name"] = cluster
+		}
 		if cpu := ParseFloat(r["alloc_cpu"]); cpu > 0 {
 			rm["nodeCpuAlloc"] = append(rm["nodeCpuAlloc"], promMetric(labels, cpu))
 		}

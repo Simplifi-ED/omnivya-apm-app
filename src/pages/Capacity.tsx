@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { PluginPage } from '@grafana/runtime';
 import {
@@ -130,7 +130,7 @@ function Capacity() {
   const nsFilter = sanitizeParam(searchParams.get('namespace') ?? '');
   const tabParam = (searchParams.get('capTab') as CapTab) || 'overview';
   const tab: CapTab = ['overview', 'namespaces', 'nodes', 'rightsizing'].includes(tabParam) ? tabParam : 'overview';
-  const [selectedRec, setSelectedRec] = useState<WorkloadRecommendation | null>(null);
+  const [selectedRecKey, setSelectedRecKey] = useState<string | null>(null);
   const [predict, setPredict] = useState<PredictTarget | null>(null);
 
   const {
@@ -232,6 +232,22 @@ function Capacity() {
   const nodes: CapacityNodeRollup[] = useMemo(() => overview?.nodes ?? [], [overview?.nodes]);
   const topWasteCpu: CapacityContainerRow[] = useMemo(() => overview?.topWasteCpu ?? [], [overview?.topWasteCpu]);
   const recommendations: WorkloadRecommendation[] = useMemo(() => recs?.recommendations ?? [], [recs?.recommendations]);
+
+  const recIdentity = (r: WorkloadRecommendation) =>
+    `${r.namespace}\0${r.workloadKind}\0${r.workloadName}\0${r.container}\0${r.environment ?? ''}`;
+
+  // Clear selection when recommendation request scope changes; resolve open
+  // drawer against the latest response so yamlPatch is never stale.
+  useEffect(() => {
+    setSelectedRecKey(null);
+  }, [fromMs, toMs, nsFilter, env]);
+
+  const selectedRec = useMemo(() => {
+    if (!selectedRecKey) {
+      return null;
+    }
+    return recommendations.find((r) => recIdentity(r) === selectedRecKey) ?? null;
+  }, [recommendations, selectedRecKey]);
 
   const nsColumns = useMemo<Array<Column<CapacityNamespaceRollup>>>(
     () => [
@@ -422,7 +438,12 @@ function Capacity() {
         sortType: 'alphanumeric',
         cell: ({ row }) => (
           <Stack direction="column" gap={0}>
-            <Button variant="secondary" fill="text" size="sm" onClick={() => setSelectedRec(row.original)}>
+            <Button
+              variant="secondary"
+              fill="text"
+              size="sm"
+              onClick={() => setSelectedRecKey(recIdentity(row.original))}
+            >
               {row.original.workloadKind}/{row.original.workloadName}
             </Button>
             <Text variant="bodySmall" color="secondary">
@@ -757,7 +778,7 @@ function Capacity() {
             {selectedRec && (
               <Drawer
                 title={`${selectedRec.workloadName} / ${selectedRec.container}`}
-                onClose={() => setSelectedRec(null)}
+                onClose={() => setSelectedRecKey(null)}
               >
                 <Stack direction="column" gap={2}>
                   <TextArea value={selectedRec.yamlPatch} readOnly rows={16} />

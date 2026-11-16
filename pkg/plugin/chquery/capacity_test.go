@@ -80,11 +80,29 @@ func TestCapacityRecsBucketSQL_AndHistory(t *testing.T) {
 	if !strings.Contains(owner, MetricKubePodOwner) {
 		t.Fatal("owner SQL missing kube_pod_owner")
 	}
-	hist := CapacityHistorySeriesSQL("ns", "app", "", from, to, 60)
-	for _, want := range []string{"bucket_ms", MetricContainerCPUUsage, MetricKubePodRestarts, "app"} {
+	hist := CapacityHistorySeriesSQL("ns", "app", "", "", from, to, 60)
+	for _, want := range []string{"bucket_ms", MetricContainerCPUUsage, MetricKubePodRestarts, "app", "k8s_cluster_name"} {
 		if !strings.Contains(hist, want) {
 			t.Errorf("history SQL missing %q", want)
 		}
+	}
+}
+
+func TestCapacityEnvFilter_CommaSeparated(t *testing.T) {
+	single := capacityEnvFilter("prod")
+	if strings.Contains(single, "IN (") || !strings.Contains(single, "= 'prod'") {
+		t.Fatalf("single: %s", single)
+	}
+	multi := capacityEnvFilter("prod, staging")
+	if !strings.Contains(multi, "IN (") || !strings.Contains(multi, "'prod'") || !strings.Contains(multi, "'staging'") {
+		t.Fatalf("multi: %s", multi)
+	}
+}
+
+func TestCapacityNodeAllocSQL_GroupsByCluster(t *testing.T) {
+	sql := CapacityNodeAllocSQL("prod", time.Now().Add(-time.Hour), time.Now())
+	if !strings.Contains(sql, "GROUP BY resource, node, k8s_cluster_name") {
+		t.Fatalf("missing cluster group: %s", sql)
 	}
 }
 

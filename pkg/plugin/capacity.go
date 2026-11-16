@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -914,9 +915,37 @@ func capacityScope(namespace, env, envLabel string) string {
 		parts = append(parts, fmt.Sprintf(`namespace="%s"`, namespace))
 	}
 	if env != "" && envLabel != "" {
-		parts = append(parts, fmt.Sprintf(`%s="%s"`, envLabel, env))
+		// Comma-separated environments → regex match (mirrors CH capacityEnvFilter).
+		envs := strings.Split(env, ",")
+		clean := make([]string, 0, len(envs))
+		for _, e := range envs {
+			e = strings.TrimSpace(e)
+			if e != "" {
+				clean = append(clean, e)
+			}
+		}
+		switch len(clean) {
+		case 0:
+		case 1:
+			parts = append(parts, fmt.Sprintf(`%s="%s"`, envLabel, clean[0]))
+		default:
+			quoted := make([]string, len(clean))
+			for i, e := range clean {
+				quoted[i] = regexp.QuoteMeta(e)
+			}
+			parts = append(parts, fmt.Sprintf(`%s=~"^(%s)$"`, envLabel, strings.Join(quoted, "|")))
+		}
 	}
 	return strings.Join(parts, ",")
+}
+
+// capacityAppendWorkloadScope restricts PromQL selectors to pods for a workload.
+// Matches exact pod name or controller-managed suffixes (ReplicaSet hash / STS ordinal).
+func capacityAppendWorkloadScope(scope, workload string) string {
+	if workload == "" {
+		return scope
+	}
+	return scope + fmt.Sprintf(`,pod=~"^%s(-.*)?$"`, regexp.QuoteMeta(workload))
 }
 
 func capacityCPUUsageExpr(ctr otelconfig.ContainerMetrics, scope string) string {
@@ -1439,7 +1468,7 @@ func (a *App) resolveHistory(ctx context.Context, req *http.Request, namespace, 
 			return resp
 		}
 		if ch := a.chForRequest(req); ch != nil {
-			chResp := a.queryHistoryClickHouse(ctx, ch, namespace, container, env, from, to)
+			chResp := a.queryHistoryClickHouse(ctx, ch, namespace, workload, container, env, from, to)
 			if chResp.Available {
 				return chResp
 			}
@@ -1453,7 +1482,7 @@ func (a *App) resolveHistory(ctx context.Context, req *http.Request, namespace, 
 		return resp
 	}
 	if ch := a.chForRequest(req); ch != nil {
-		return a.queryHistoryClickHouse(ctx, ch, namespace, container, env, from, to)
+		return a.queryHistoryClickHouse(ctx, ch, namespace, workload, container, env, from, to)
 	}
 	return empty
 }
@@ -1472,7 +1501,7 @@ func (a *App) queryHistoryProm(ctx context.Context, namespace, workload, contain
 	if container != "" {
 		scope += fmt.Sprintf(`,container="%s"`, container)
 	}
-	_ = workload
+	scope = capacityAppendWorkloadScope(scope, workload)
 
 	step := to.Sub(from) / 50
 	if step < 15*time.Second {
@@ -1533,7 +1562,7 @@ func (a *App) queryHistoryProm(ctx context.Context, namespace, workload, contain
 	return CapacityHistoryResponse{Available: true, Series: series, Note: note}
 }
 
-func (a *App) queryHistoryClickHouse(ctx context.Context, ch *queries.ClickHouseClient, namespace, container, env string, from, to time.Time) CapacityHistoryResponse {
+func (a *App) queryHistoryClickHouse(ctx context.Context, ch *queries.ClickHouseClient, namespace, workload, container, env string, from, to time.Time) CapacityHistoryResponse {
 	logger := log.DefaultLogger.With("handler", "capacity-history-clickhouse")
 	note := "Only series still present in the metrics backend for this range are shown. Deleted workloads are not reconstructed."
 	empty := CapacityHistoryResponse{
@@ -1561,7 +1590,7 @@ func (a *App) queryHistoryClickHouse(ctx context.Context, ch *queries.ClickHouse
 	if step < 15 {
 		step = 15
 	}
-	histRes, err := ch.Query(ctx, chquery.CapacityHistorySeriesSQL(namespace, container, env, from, to, step), opts)
+	histRes, err := ch.Query(ctx, chquery.CapacityHistorySeriesSQL(namespace, container, env, workload, from, to, step), opts)
 	if err != nil {
 		logger.Warn("capacity history CH series failed", "error", err)
 		return empty
@@ -1614,7 +1643,7 @@ func (a *App) resolveForecast(ctx context.Context, req *http.Request, resource, 
 			return resp
 		}
 		if ch := a.chForRequest(req); ch != nil {
-			chResp := a.queryForecastClickHouse(ctx, ch, resource, namespace, container, env, from, to)
+			chResp := a.queryForecastClickHouse(ctx, ch, resource, namespace, workload, container, env, from, to)
 			if chResp.Available {
 				return chResp
 			}
@@ -1628,7 +1657,7 @@ func (a *App) resolveForecast(ctx context.Context, req *http.Request, resource, 
 		return resp
 	}
 	if ch := a.chForRequest(req); ch != nil {
-		return a.queryForecastClickHouse(ctx, ch, resource, namespace, container, env, from, to)
+		return a.queryForecastClickHouse(ctx, ch, resource, namespace, workload, container, env, from, to)
 	}
 	return empty
 }
@@ -1647,7 +1676,7 @@ func (a *App) queryForecastProm(ctx context.Context, resource, namespace, worklo
 	if container != "" {
 		scope += fmt.Sprintf(`,container="%s"`, container)
 	}
-	_ = workload
+	scope = capacityAppendWorkloadScope(scope, workload)
 
 	var usageExpr, reqExpr, limExpr string
 	if resource == "memory" {
@@ -1734,7 +1763,7 @@ func (a *App) queryForecastProm(ctx context.Context, resource, namespace, worklo
 	}
 }
 
-func (a *App) queryForecastClickHouse(ctx context.Context, ch *queries.ClickHouseClient, resource, namespace, container, env string, from, to time.Time) CapacityForecastResponse {
+func (a *App) queryForecastClickHouse(ctx context.Context, ch *queries.ClickHouseClient, resource, namespace, workload, container, env string, from, to time.Time) CapacityForecastResponse {
 	logger := log.DefaultLogger.With("handler", "capacity-forecast-clickhouse")
 	empty := CapacityForecastResponse{
 		Available: false, EnablementNote: capacityEnablementNote,
@@ -1762,7 +1791,7 @@ func (a *App) queryForecastClickHouse(ctx context.Context, ch *queries.ClickHous
 	if step < 15 {
 		step = 15
 	}
-	histRes, err := ch.Query(ctx, chquery.CapacityHistorySeriesSQL(namespace, container, env, from, to, step), opts)
+	histRes, err := ch.Query(ctx, chquery.CapacityHistorySeriesSQL(namespace, container, env, workload, from, to, step), opts)
 	if err != nil {
 		logger.Warn("capacity forecast CH series failed", "error", err)
 		return empty
