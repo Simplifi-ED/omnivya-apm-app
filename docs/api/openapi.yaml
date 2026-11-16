@@ -946,7 +946,7 @@ paths:
   /capacity/forecast:
     get:
       tags: [experimental]
-      summary: CPU or memory forecast (Grafana ML when configured, else labeled predict_linear).
+      summary: CPU or memory forecast via in-plugin linear projection over Capacity history.
       parameters:
         - { $ref: "#/components/parameters/namespaceQuery" }
         - { $ref: "#/components/parameters/environment" }

@@ -164,6 +164,7 @@ function Capacity() {
     data: history,
     loading: historyLoading,
     error: historyError,
+    refetch: refetchHistory,
   } = useFetch<CapacityHistoryResponse>(
     () =>
       getCapacityHistory(fromMs, toMs, {
@@ -179,6 +180,7 @@ function Capacity() {
     data: forecast,
     loading: forecastLoading,
     error: forecastError,
+    refetch: refetchFc,
   } = useFetch<CapacityForecastResponse>(
     () =>
       getCapacityForecast(fromMs, toMs, {
@@ -219,6 +221,8 @@ function Capacity() {
     refresh();
     refetchOverview();
     refetchRecs();
+    refetchHistory();
+    refetchFc();
   };
 
   const filteredNamespaces: CapacityNamespaceRollup[] = useMemo(() => {

@@ -641,14 +641,11 @@ func promMetric(labels map[string]string, v float64) queries.PromResult {
 }
 
 type capacityNsAgg struct {
-	nsName                   string
-	wasteCPU, wasteMem       float64
-	usageCPU, usageMem       float64
-	reqCPU, reqMem           float64
-	missReqCPU, missReqMem   int
-	missLimCPU, missLimMem   int
-	reservedCPU, reservedMem int
-	cluster                  string
+	nsName             string
+	wasteCPU, wasteMem float64
+	usageCPU, usageMem float64
+	reqCPU, reqMem     float64
+	cluster            string
 }
 
 type capacityWasteRow struct {
@@ -668,6 +665,7 @@ func emptyCapacityResultMap() map[string][]queries.PromResult {
 		"gapMissingLimCpu": {}, "gapMissingLimMem": {},
 		"gapReservedCpu": {}, "gapReservedMem": {},
 		"underCpu": {}, "underMem": {}, "throttled": {},
+		"overReqCpu": {}, "overReqMem": {},
 	}
 }
 
@@ -708,22 +706,22 @@ func accumulateCapacityRow(
 		}
 	}
 	if hasUsage && !r.HasReqCPU {
-		ns.missReqCPU++
+		rm["gapMissingReqCpu"] = append(rm["gapMissingReqCpu"], promMetric(labels, 1))
 	}
 	if hasUsage && !r.HasReqMem {
-		ns.missReqMem++
+		rm["gapMissingReqMem"] = append(rm["gapMissingReqMem"], promMetric(labels, 1))
 	}
 	if hasUsage && !r.HasLimCPU {
-		ns.missLimCPU++
+		rm["gapMissingLimCpu"] = append(rm["gapMissingLimCpu"], promMetric(labels, 1))
 	}
 	if hasUsage && !r.HasLimMem {
-		ns.missLimMem++
+		rm["gapMissingLimMem"] = append(rm["gapMissingLimMem"], promMetric(labels, 1))
 	}
 	if r.HasReqCPU && !r.HasUsageCPU && r.UsageCPU == 0 {
-		ns.reservedCPU++
+		rm["gapReservedCpu"] = append(rm["gapReservedCpu"], promMetric(labels, 1))
 	}
 	if r.HasReqMem && !r.HasUsageMem && r.UsageMem == 0 {
-		ns.reservedMem++
+		rm["gapReservedMem"] = append(rm["gapReservedMem"], promMetric(labels, 1))
 	}
 	if r.HasReqCPU && r.UsageCPU > r.ReqCPU {
 		rm["underCpu"] = append(rm["underCpu"], promMetric(labels, r.UsageCPU-r.ReqCPU))
@@ -752,18 +750,15 @@ func emitCapacityNamespaceGaps(rm map[string][]queries.PromResult, nsMap map[str
 		appendIfPos("nsMemUsage", a.usageMem)
 		appendIfPos("nsCpuReq", a.reqCPU)
 		appendIfPos("nsMemReq", a.reqMem)
-		appendIfPos("gapMissingReqCpu", float64(a.missReqCPU))
-		appendIfPos("gapMissingReqMem", float64(a.missReqMem))
-		appendIfPos("gapMissingLimCpu", float64(a.missLimCPU))
-		appendIfPos("gapMissingLimMem", float64(a.missLimMem))
-		appendIfPos("gapReservedCpu", float64(a.reservedCPU))
-		appendIfPos("gapReservedMem", float64(a.reservedMem))
 	}
 }
 
 func emitCapacityTopWaste(rm map[string][]queries.PromResult, topCPU, topMem []capacityWasteRow) {
 	sort.Slice(topCPU, func(i, j int) bool { return topCPU[i].waste > topCPU[j].waste })
 	sort.Slice(topMem, func(i, j int) bool { return topMem[i].waste > topMem[j].waste })
+	// Full-population counts before truncating display lists.
+	rm["overReqCpu"] = []queries.PromResult{promMetric(nil, float64(len(topCPU)))}
+	rm["overReqMem"] = []queries.PromResult{promMetric(nil, float64(len(topMem)))}
 	const topN = 50
 	if len(topCPU) > topN {
 		topCPU = topCPU[:topN]

@@ -259,7 +259,7 @@ func (a *App) handleCapacity(w http.ResponseWriter, req *http.Request) {
 	env := parseEnvironment(req)
 
 	orgID := req.Header.Get("X-Grafana-Org-Id")
-	ck := cacheKey("capacity", orgID, roundedUnix(to), namespace, env)
+	ck := cacheKey("capacity", orgID, a.capacityCallerKey(ctx, req), roundedUnix(to), namespace, env)
 	cache := a.capacityResponseCache()
 	if cached, ok := cache.get(ck); ok {
 		w.Header().Set("Content-Type", "application/json")
@@ -295,7 +295,7 @@ func (a *App) handleNamespaceCapacity(w http.ResponseWriter, req *http.Request) 
 	env := parseEnvironment(req)
 
 	orgID := req.Header.Get("X-Grafana-Org-Id")
-	ck := cacheKey("capacity-ns", orgID, roundedUnix(to), namespace, env)
+	ck := cacheKey("capacity-ns", orgID, a.capacityCallerKey(ctx, req), roundedUnix(to), namespace, env)
 	a.writeCached(w, ck, "querying namespace capacity failed", func() (any, error) {
 		return a.resolveCapacity(ctx, req, namespace, env, to), nil
 	})
@@ -313,7 +313,7 @@ func (a *App) handleCapacityRecommendations(w http.ResponseWriter, req *http.Req
 	env := parseEnvironment(req)
 
 	orgID := req.Header.Get("X-Grafana-Org-Id")
-	ck := cacheKey("capacity-recs", orgID, roundedUnix(from), roundedUnix(to), namespace, env)
+	ck := cacheKey("capacity-recs", orgID, a.capacityCallerKey(ctx, req), roundedUnix(from), roundedUnix(to), namespace, env)
 	cache := a.capacityResponseCache()
 	if cached, ok := cache.get(ck); ok {
 		w.Header().Set("Content-Type", "application/json")
@@ -347,7 +347,7 @@ func (a *App) handleCapacityHistory(w http.ResponseWriter, req *http.Request) {
 	env := parseEnvironment(req)
 
 	orgID := req.Header.Get("X-Grafana-Org-Id")
-	ck := cacheKey("capacity-hist", orgID, roundedUnix(from), roundedUnix(to), namespace, workload, container, env)
+	ck := cacheKey("capacity-hist", orgID, a.capacityCallerKey(ctx, req), roundedUnix(from), roundedUnix(to), namespace, workload, container, env)
 	a.writeCached(w, ck, "querying capacity history failed", func() (any, error) {
 		return a.resolveHistory(ctx, req, namespace, workload, container, env, from, to), nil
 	})
@@ -383,7 +383,7 @@ func (a *App) handleCapacityForecast(w http.ResponseWriter, req *http.Request) {
 	}
 
 	orgID := req.Header.Get("X-Grafana-Org-Id")
-	ck := cacheKey("capacity-fc", orgID, roundedUnix(from), roundedUnix(to), resource, namespace, workload, container, env)
+	ck := cacheKey("capacity-fc", orgID, a.capacityCallerKey(ctx, req), roundedUnix(from), roundedUnix(to), resource, namespace, workload, container, env)
 	a.writeCached(w, ck, "querying capacity forecast failed", func() (any, error) {
 		return a.resolveForecast(ctx, req, resource, namespace, workload, container, env, from, to), nil
 	})
@@ -447,26 +447,28 @@ func (a *App) queryCapacityProm(ctx context.Context, namespace, env string, at t
 		{"sumMemUsage", fmt.Sprintf(`sum(%s)`, memUsage)},
 		{"sumCpuReq", fmt.Sprintf(`sum(%s)`, cpuReq)},
 		{"sumMemReq", fmt.Sprintf(`sum(%s)`, memReq)},
-		{"gapMissingReqCpu", capacityMissingRequests(cpuUsage, cpuReq)},
-		{"gapMissingReqMem", capacityMissingRequests(memUsage, memReq)},
-		{"gapMissingLimCpu", capacityMissingRequests(cpuUsage, cpuLim)},
-		{"gapMissingLimMem", capacityMissingRequests(memUsage, memLim)},
-		{"gapReservedCpu", capacityReservedWithoutUsage(cpuReq, cpuUsage)},
-		{"gapReservedMem", capacityReservedWithoutUsage(memReq, memUsage)},
+		{"gapMissingReqCpu", capacityMissingRequestContainers(cpuUsage, cpuReq)},
+		{"gapMissingReqMem", capacityMissingRequestContainers(memUsage, memReq)},
+		{"gapMissingLimCpu", capacityMissingRequestContainers(cpuUsage, cpuLim)},
+		{"gapMissingLimMem", capacityMissingRequestContainers(memUsage, memLim)},
+		{"gapReservedCpu", capacityReservedWithoutUsageContainers(cpuReq, cpuUsage)},
+		{"gapReservedMem", capacityReservedWithoutUsageContainers(memReq, memUsage)},
 		// Container-level under/throttle series: gap counts + top risk from one round-trip each.
 		{"underCpu", capacityUnderProvisionedContainers(cpuUsage, cpuReq)},
 		{"underMem", capacityUnderProvisionedContainers(memUsage, memReq)},
 		{"throttled", capacityThrottledContainers(ctr, scope)},
-		{"allocCpu", fmt.Sprintf(`sum(%s{%s="cpu"})`, ctr.NodeAllocatable, ctr.ResourceLabel)},
-		{"allocMem", fmt.Sprintf(`sum(%s{%s="memory"})`, ctr.NodeAllocatable, ctr.ResourceLabel)},
+		{"overReqCpu", capacityOverRequestedCount(cpuReq, cpuUsage)},
+		{"overReqMem", capacityOverRequestedCount(memReq, memUsage)},
+		{"allocCpu", capacityNodeAllocSum(ctr.NodeAllocatable, ctr.ResourceLabel, "cpu", a.otelCfg.Labels.DeploymentEnv, env)},
+		{"allocMem", capacityNodeAllocSum(ctr.NodeAllocatable, ctr.ResourceLabel, "memory", a.otelCfg.Labels.DeploymentEnv, env)},
 		{"nsCpuUsage", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, cpuUsage)},
 		{"nsMemUsage", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, memUsage)},
 		{"nsCpuReq", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, cpuReq)},
 		{"nsMemReq", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, memReq)},
 		{"nodeCpuUsage", fmt.Sprintf(`sum by (node, kubernetes_io_hostname, instance) (%s)`, cpuUsage)},
 		{"nodeMemUsage", fmt.Sprintf(`sum by (node, kubernetes_io_hostname, instance) (%s)`, memUsage)},
-		{"nodeCpuAlloc", fmt.Sprintf(`sum by (node) (%s{%s="cpu"})`, ctr.NodeAllocatable, ctr.ResourceLabel)},
-		{"nodeMemAlloc", fmt.Sprintf(`sum by (node) (%s{%s="memory"})`, ctr.NodeAllocatable, ctr.ResourceLabel)},
+		{"nodeCpuAlloc", capacityNodeAllocByNode(ctr.NodeAllocatable, ctr.ResourceLabel, "cpu", a.otelCfg.Labels.DeploymentEnv, env)},
+		{"nodeMemAlloc", capacityNodeAllocByNode(ctr.NodeAllocatable, ctr.ResourceLabel, "memory", a.otelCfg.Labels.DeploymentEnv, env)},
 		// Root-cgroup fs (container=""); soft-null in UI when series absent — never invent from KSM capacity alone.
 		{"nodeFsUsage", `sum by (node, kubernetes_io_hostname, instance) (container_fs_usage_bytes{container="",id="/"})`},
 		{"nodeFsLimit", `sum by (node, kubernetes_io_hostname, instance) (container_fs_limit_bytes{container="",id="/"})`},
@@ -571,28 +573,23 @@ func (a *App) aggregateCapacity(resultMap map[string][]queries.PromResult) Capac
 	applyNsMetric("nsCpuReq", func(row *CapacityNamespaceRollup, v float64) { row.CPURequest = roundTo(v, 4) })
 	applyNsMetric("nsMemReq", func(row *CapacityNamespaceRollup, v float64) { row.MemRequest = roundTo(v, 0) })
 
-	addGapCount := func(key string, set func(*CapacityNamespaceRollup, int), fleet *int) {
-		for _, r := range resultMap[key] {
-			n := int(safeFloat(r.Value.Float()))
-			*fleet += n
-			if ns := r.Metric["namespace"]; ns != "" {
-				set(ensureNs(ns, r.Metric["k8s_cluster_name"]), n)
-			}
-		}
-	}
-
 	gaps := CapacityGapCounts{}
-	addGapCount("gapMissingReqCpu", func(r *CapacityNamespaceRollup, n int) { r.MissingRequest += n }, &gaps.MissingRequest)
-	addGapCount("gapMissingReqMem", func(r *CapacityNamespaceRollup, n int) { r.MissingRequest += n }, &gaps.MissingRequest)
-	// Deduplicate missing-request double-count across cpu/mem at fleet level by taking max of cpu/mem
-	// actually we summed both — plan wants container gaps. Keep sum of distinct query results as counts of containers per resource.
-	gaps.MissingLimit = 0
-	addGapCount("gapMissingLimCpu", func(r *CapacityNamespaceRollup, n int) { r.MissingLimit += n }, &gaps.MissingLimit)
-	addGapCount("gapMissingLimMem", func(r *CapacityNamespaceRollup, n int) { r.MissingLimit += n }, &gaps.MissingLimit)
-	addGapCount("gapReservedCpu", func(r *CapacityNamespaceRollup, _ int) {}, &gaps.ReservedWithoutUsage)
-	addGapCount("gapReservedMem", func(r *CapacityNamespaceRollup, _ int) {}, &gaps.ReservedWithoutUsage)
-	countContainerGaps(resultMap["underCpu"], nsMap, func(r *CapacityNamespaceRollup) { r.UnderProvisioned++ }, &gaps.UnderProvisioned)
-	countContainerGaps(resultMap["underMem"], nsMap, func(r *CapacityNamespaceRollup) { r.UnderProvisioned++ }, &gaps.UnderProvisioned)
+	countContainerGapsUnion(
+		[][]queries.PromResult{resultMap["gapMissingReqCpu"], resultMap["gapMissingReqMem"]},
+		nsMap, func(r *CapacityNamespaceRollup) { r.MissingRequest++ }, &gaps.MissingRequest,
+	)
+	countContainerGapsUnion(
+		[][]queries.PromResult{resultMap["gapMissingLimCpu"], resultMap["gapMissingLimMem"]},
+		nsMap, func(r *CapacityNamespaceRollup) { r.MissingLimit++ }, &gaps.MissingLimit,
+	)
+	countContainerGapsUnion(
+		[][]queries.PromResult{resultMap["gapReservedCpu"], resultMap["gapReservedMem"]},
+		nsMap, func(*CapacityNamespaceRollup) {}, &gaps.ReservedWithoutUsage,
+	)
+	countContainerGapsUnion(
+		[][]queries.PromResult{resultMap["underCpu"], resultMap["underMem"]},
+		nsMap, func(r *CapacityNamespaceRollup) { r.UnderProvisioned++ }, &gaps.UnderProvisioned,
+	)
 	countContainerGaps(resultMap["throttled"], nsMap, func(r *CapacityNamespaceRollup) { r.Throttled++ }, &gaps.Throttled)
 
 	var totalWasteCPU, totalWasteMem float64
@@ -618,11 +615,19 @@ func (a *App) aggregateCapacity(resultMap map[string][]queries.PromResult) Capac
 	deficitMem := clampMin0(sumMemUsage - sumMemReq)
 	eff.DeficitMonthlyUSD = roundTo(monthlyUSD(deficitCPU, deficitMem, cpuHour, memHour), 2)
 
-	// Over-requested container counts: containers with waste > 0 from topk lists.
+	// Top lists stay capped; fleet over-requested counts use full-population series when present.
 	topCPU := containerRowsFromResults(resultMap["wasteCpuTop"], "cpu")
 	topMem := containerRowsFromResults(resultMap["wasteMemTop"], "mem")
-	gaps.OverRequestedCPU = len(topCPU)
-	gaps.OverRequestedMem = len(topMem)
+	if rs := resultMap["overReqCpu"]; len(rs) > 0 {
+		gaps.OverRequestedCPU = int(firstValue(rs))
+	} else {
+		gaps.OverRequestedCPU = len(topCPU)
+	}
+	if rs := resultMap["overReqMem"]; len(rs) > 0 {
+		gaps.OverRequestedMem = int(firstValue(rs))
+	} else {
+		gaps.OverRequestedMem = len(topMem)
+	}
 
 	risk := riskRowsFromResults(resultMap["underCpu"], resultMap["underMem"], resultMap["throttled"])
 	nodes := buildCapacityNodes(resultMap)
@@ -914,29 +919,39 @@ func capacityScope(namespace, env, envLabel string) string {
 	if namespace != "" {
 		parts = append(parts, fmt.Sprintf(`namespace="%s"`, namespace))
 	}
-	if env != "" && envLabel != "" {
-		// Comma-separated environments → regex match (mirrors CH capacityEnvFilter).
-		envs := strings.Split(env, ",")
-		clean := make([]string, 0, len(envs))
-		for _, e := range envs {
-			e = strings.TrimSpace(e)
-			if e != "" {
-				clean = append(clean, e)
-			}
-		}
-		switch len(clean) {
-		case 0:
-		case 1:
-			parts = append(parts, fmt.Sprintf(`%s="%s"`, envLabel, clean[0]))
-		default:
-			quoted := make([]string, len(clean))
-			for i, e := range clean {
-				quoted[i] = regexp.QuoteMeta(e)
-			}
-			parts = append(parts, fmt.Sprintf(`%s=~"^(%s)$"`, envLabel, strings.Join(quoted, "|")))
-		}
+	if m := envMatcher(envLabel, env); m != "" {
+		parts = append(parts, m)
 	}
 	return strings.Join(parts, ",")
+}
+
+// capacityCallerKey scopes response cache entries by user when requests run with
+// forwarded credentials (same convention as scorecard / namespace scorecard).
+func (a *App) capacityCallerKey(ctx context.Context, req *http.Request) string {
+	if a.resolveServiceToken(ctx) != "" {
+		return ""
+	}
+	caller := req.Header.Get("X-Grafana-Id")
+	if caller == "" {
+		caller = req.Header.Get("X-Grafana-User")
+	}
+	return caller
+}
+
+func capacityNodeAllocSum(metric, resourceLabel, resource, envLabel, env string) string {
+	parts := []string{fmt.Sprintf(`%s="%s"`, resourceLabel, resource)}
+	if m := envMatcher(envLabel, env); m != "" {
+		parts = append(parts, m)
+	}
+	return fmt.Sprintf(`sum(%s{%s})`, metric, strings.Join(parts, ","))
+}
+
+func capacityNodeAllocByNode(metric, resourceLabel, resource, envLabel, env string) string {
+	parts := []string{fmt.Sprintf(`%s="%s"`, resourceLabel, resource)}
+	if m := envMatcher(envLabel, env); m != "" {
+		parts = append(parts, m)
+	}
+	return fmt.Sprintf(`sum by (node) (%s{%s})`, metric, strings.Join(parts, ","))
 }
 
 // capacityAppendWorkloadScope restricts PromQL selectors to pods for a workload.
@@ -978,16 +993,23 @@ func capacityWasteTopk(reqExpr, usageExpr string, k int) string {
 	)
 }
 
-func capacityMissingRequests(usageExpr, reqExpr string) string {
+func capacityMissingRequestContainers(usageExpr, reqExpr string) string {
 	return fmt.Sprintf(
-		`count by (namespace) (count by (namespace, pod, container) (%s) unless on (namespace, pod, container) count by (namespace, pod, container) (%s))`,
+		`count by (namespace, pod, container) (%s) unless on (namespace, pod, container) count by (namespace, pod, container) (%s)`,
 		usageExpr, reqExpr,
 	)
 }
 
-func capacityReservedWithoutUsage(reqExpr, usageExpr string) string {
+func capacityReservedWithoutUsageContainers(reqExpr, usageExpr string) string {
 	return fmt.Sprintf(
-		`count by (namespace) (count by (namespace, pod, container) (%s) unless on (namespace, pod, container) count by (namespace, pod, container) (%s))`,
+		`count by (namespace, pod, container) (%s) unless on (namespace, pod, container) count by (namespace, pod, container) (%s)`,
+		reqExpr, usageExpr,
+	)
+}
+
+func capacityOverRequestedCount(reqExpr, usageExpr string) string {
+	return fmt.Sprintf(
+		`count(clamp_min((%s) - on (namespace, pod, container) group_left() (%s), 0) > 0)`,
 		reqExpr, usageExpr,
 	)
 }
@@ -1012,23 +1034,42 @@ func countContainerGaps(
 	bumpNs func(*CapacityNamespaceRollup),
 	fleet *int,
 ) {
-	for _, r := range rs {
-		ns := r.Metric["namespace"]
-		if ns == "" {
-			continue
+	countContainerGapsUnion([][]queries.PromResult{rs}, nsMap, bumpNs, fleet)
+}
+
+// countContainerGapsUnion counts each container identity at most once across the
+// given result sets (e.g. CPU+memory gap categories).
+func countContainerGapsUnion(
+	sets [][]queries.PromResult,
+	nsMap map[string]*CapacityNamespaceRollup,
+	bumpNs func(*CapacityNamespaceRollup),
+	fleet *int,
+) {
+	seen := map[string]struct{}{}
+	for _, rs := range sets {
+		for _, r := range rs {
+			ns := r.Metric["namespace"]
+			if ns == "" {
+				continue
+			}
+			env := r.Metric["k8s_cluster_name"]
+			id := ns + "\x00" + r.Metric["pod"] + "\x00" + r.Metric["container"] + "\x00" + env
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			*fleet++
+			k := ns
+			if env != "" {
+				k = env + "\x00" + ns
+			}
+			row := nsMap[k]
+			if row == nil {
+				row = &CapacityNamespaceRollup{Namespace: ns, Environment: env}
+				nsMap[k] = row
+			}
+			bumpNs(row)
 		}
-		*fleet++
-		env := r.Metric["k8s_cluster_name"]
-		k := ns
-		if env != "" {
-			k = env + "\x00" + ns
-		}
-		row := nsMap[k]
-		if row == nil {
-			row = &CapacityNamespaceRollup{Namespace: ns, Environment: env}
-			nsMap[k] = row
-		}
-		bumpNs(row)
 	}
 }
 
@@ -1182,6 +1223,7 @@ func (a *App) queryRecommendations(ctx context.Context, namespace, env string, f
 		{"memLim", memLim},
 		{"throttled", fmt.Sprintf(`sum by (namespace, pod, container) (rate(%s{%s}[%s]))`, ctr.CPUThrottled, scope, capacityLookback)},
 		{"podOwner", fmt.Sprintf(`%s{%s}`, ctr.PodOwner, namespaceOnlyScope(namespace))},
+		{"jobOwner", fmt.Sprintf(`kube_job_owner{%s}`, namespaceOnlyScope(namespace))},
 	}
 	resultMap := a.runInstantQueries(ctx, to, jobs, logger)
 	return a.aggregateRecommendations(resultMap, env, window)
@@ -1239,6 +1281,11 @@ func (a *App) queryRecommendationsClickHouse(ctx context.Context, ch *queries.Cl
 		owners = chquery.ParseCapacityOwners(ownerRes.Maps())
 	}
 	rm := capacityRecsCHToResultMap(chquery.ParseCapacityRecRows(bucketRes.Maps()), owners)
+	if jobRes, jerr := ch.Query(ctx, chquery.JobsGaugeLatestSQL(chquery.MetricKubeJobOwner, namespace, from, to), opts); jerr == nil {
+		rm["jobOwner"] = chquery.ParseJobsGaugeRows(jobRes.Maps())
+	} else {
+		logger.Warn("capacity recs CH job owner query failed", "error", jerr)
+	}
 	return a.aggregateRecommendations(rm, env, window)
 }
 
@@ -1287,64 +1334,24 @@ func capacityRecsCHToResultMap(rows []chquery.CapacityRecRow, owners []chquery.C
 	return rm
 }
 
+type capacityPodID struct{ ns, pod, container, cluster string }
+
+type capacityObsRec struct {
+	rec                  *WorkloadRecommendation
+	hasCPUObs, hasMemObs bool
+}
+
+type capacityWkKey struct{ ns, kind, name, container, cluster string }
+
+type capacityWkAgg struct {
+	rec                  *WorkloadRecommendation
+	hasCPUObs, hasMemObs bool
+}
+
 func (a *App) aggregateRecommendations(resultMap map[string][]queries.PromResult, env string, window time.Duration) CapacityRecommendationsResponse {
-	type id struct{ ns, pod, container string }
-	obs := map[id]*WorkloadRecommendation{}
-
-	upsert := func(rs []queries.PromResult, apply func(*WorkloadRecommendation, float64, map[string]string)) {
-		for _, r := range rs {
-			ns := r.Metric["namespace"]
-			pod := r.Metric["pod"]
-			c := r.Metric["container"]
-			if ns == "" || c == "" {
-				continue
-			}
-			k := id{ns, pod, c}
-			rec := obs[k]
-			if rec == nil {
-				rec = &WorkloadRecommendation{
-					Namespace:   ns,
-					Environment: env,
-					Container:   c,
-					Replicas:    1,
-					Confidence:  capacityConfidence(window),
-				}
-				obs[k] = rec
-			}
-			apply(rec, safeFloat(r.Value.Float()), r.Metric)
-		}
-	}
-
-	upsert(resultMap["cpuP95"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Observed.CPUP95 = v })
-	upsert(resultMap["cpuP50"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Observed.CPUP50 = v })
-	upsert(resultMap["cpuMax"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Observed.CPUMax = v })
-	upsert(resultMap["memP95"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Observed.MemP95 = v })
-	upsert(resultMap["memMax"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Observed.MemMax = v })
-	upsert(resultMap["cpuReq"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Current.CPUReq = v })
-	upsert(resultMap["memReq"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Current.MemReq = v })
-	upsert(resultMap["cpuLim"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) {
-		if v > 0 {
-			rec.Current.CPULim = &v
-		}
-	})
-	upsert(resultMap["memLim"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Current.MemLim = v })
-	upsert(resultMap["throttled"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Observed.ThrottledRate = v })
-
-	ownerByPod := map[string]struct{ kind, name string }{}
-	for _, r := range resultMap["podOwner"] {
-		pod := r.Metric["pod"]
-		kind := r.Metric["owner_kind"]
-		name := r.Metric["owner_name"]
-		if kind == "ReplicaSet" {
-			kind = "Deployment"
-			name = stripReplicaSetHash(name)
-		}
-		if kind == "Job" {
-			kind = "CronJob"
-			name = stripReplicaSetHash(name)
-		}
-		ownerByPod[pod] = struct{ kind, name string }{kind, name}
-	}
+	obs := collectCapacityObservations(resultMap, env, window)
+	ownerByPod := capacityOwnerByPod(resultMap["podOwner"], resultMap["jobOwner"])
+	byWorkload := mergeCapacityByWorkload(obs, ownerByPod)
 
 	rates := queriesCapacityRates{
 		CPUHourUSD:    a.settings.CapacityCostRates.CPUHourUSD,
@@ -1352,59 +1359,11 @@ func (a *App) aggregateRecommendations(resultMap map[string][]queries.PromResult
 	}
 	cpuHour, memHour := capacityCostRates(rates)
 
-	type wk struct{ ns, kind, name, container string }
-	byWorkload := map[wk]*WorkloadRecommendation{}
-	for k, rec := range obs {
-		owner, ok := ownerByPod[k.pod]
-		if !ok || owner.name == "" {
-			owner = struct{ kind, name string }{"Pod", k.pod}
-		}
-		wkey := wk{k.ns, owner.kind, owner.name, k.container}
-		agg := byWorkload[wkey]
-		if agg == nil {
-			rec.WorkloadKind = owner.kind
-			rec.WorkloadName = owner.name
-			byWorkload[wkey] = rec
-			continue
-		}
-		agg.Replicas++
-		if rec.Observed.CPUP95 > agg.Observed.CPUP95 {
-			agg.Observed.CPUP95 = rec.Observed.CPUP95
-		}
-		if rec.Observed.CPUMax > agg.Observed.CPUMax {
-			agg.Observed.CPUMax = rec.Observed.CPUMax
-		}
-		if rec.Observed.MemP95 > agg.Observed.MemP95 {
-			agg.Observed.MemP95 = rec.Observed.MemP95
-		}
-		if rec.Observed.MemMax > agg.Observed.MemMax {
-			agg.Observed.MemMax = rec.Observed.MemMax
-		}
-		agg.Current.CPUReq += rec.Current.CPUReq
-		agg.Current.MemReq += rec.Current.MemReq
-		agg.Current.MemLim += rec.Current.MemLim
-	}
-
 	out := make([]WorkloadRecommendation, 0, len(byWorkload))
-	for _, rec := range byWorkload {
-		cpuReq, memReq, memLim := burstableRecommendation(rec.Observed.CPUP95, rec.Observed.MemP95, rec.Observed.MemMax)
-		rec.Burstable = WorkloadResources{CPUReq: cpuReq, MemReq: memReq, MemLim: memLim}
-		gCPU, gCPULim, gMem, gMemLim := guaranteedRecommendation(rec.Observed.CPUMax, rec.Observed.MemMax)
-		gLim := gCPULim
-		rec.Guaranteed = WorkloadResources{CPUReq: gCPU, CPULim: &gLim, MemReq: gMem, MemLim: gMemLim}
-		var curLim float64
-		if rec.Current.CPULim != nil {
-			curLim = *rec.Current.CPULim
+	for _, agg := range byWorkload {
+		if rec, ok := finalizeCapacityRecommendation(agg, cpuHour, memHour); ok {
+			out = append(out, rec)
 		}
-		rec.QoSClass = qosClass(rec.Current.CPUReq, curLim, rec.Current.MemReq, rec.Current.MemLim)
-		rec.YAMLPatch = resourcesYAMLPatch(cpuReq, nil, memReq, memLim)
-		wasteCPU := clampMin0(rec.Current.CPUReq - rec.Observed.CPUP95)
-		wasteMem := clampMin0(rec.Current.MemReq - rec.Observed.MemP95)
-		rec.ReclaimableMonthlyUSD = roundTo(monthlyUSD(wasteCPU, wasteMem, cpuHour, memHour), 2)
-		defCPU := clampMin0(rec.Observed.CPUP95 - rec.Current.CPUReq)
-		defMem := clampMin0(rec.Observed.MemP95 - rec.Current.MemReq)
-		rec.DeficitMonthlyUSD = roundTo(monthlyUSD(defCPU, defMem, cpuHour, memHour), 2)
-		out = append(out, *rec)
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ReclaimableMonthlyUSD == out[j].ReclaimableMonthlyUSD {
@@ -1415,7 +1374,6 @@ func (a *App) aggregateRecommendations(resultMap map[string][]queries.PromResult
 	if len(out) > capacityTopN {
 		out = out[:capacityTopN]
 	}
-
 	if len(out) == 0 {
 		return CapacityRecommendationsResponse{
 			Available:       false,
@@ -1424,6 +1382,199 @@ func (a *App) aggregateRecommendations(resultMap map[string][]queries.PromResult
 		}
 	}
 	return CapacityRecommendationsResponse{Available: true, Recommendations: out}
+}
+
+func collectCapacityObservations(resultMap map[string][]queries.PromResult, env string, window time.Duration) map[capacityPodID]*capacityObsRec {
+	obs := map[capacityPodID]*capacityObsRec{}
+	upsert := func(rs []queries.PromResult, apply func(*capacityObsRec, float64)) {
+		for _, r := range rs {
+			ns := r.Metric["namespace"]
+			pod := r.Metric["pod"]
+			c := r.Metric["container"]
+			if ns == "" || c == "" {
+				continue
+			}
+			cluster := r.Metric["k8s_cluster_name"]
+			k := capacityPodID{ns, pod, c, cluster}
+			entry := obs[k]
+			if entry == nil {
+				envName := cluster
+				if envName == "" {
+					envName = env
+				}
+				entry = &capacityObsRec{
+					rec: &WorkloadRecommendation{
+						Namespace:   ns,
+						Environment: envName,
+						Container:   c,
+						Replicas:    1,
+						Confidence:  capacityConfidence(window),
+					},
+				}
+				obs[k] = entry
+			}
+			apply(entry, safeFloat(r.Value.Float()))
+		}
+	}
+	upsert(resultMap["cpuP95"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUP95 = v; e.hasCPUObs = true })
+	upsert(resultMap["cpuP50"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUP50 = v; e.hasCPUObs = true })
+	upsert(resultMap["cpuMax"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUMax = v; e.hasCPUObs = true })
+	upsert(resultMap["memP95"], func(e *capacityObsRec, v float64) { e.rec.Observed.MemP95 = v; e.hasMemObs = true })
+	upsert(resultMap["memMax"], func(e *capacityObsRec, v float64) { e.rec.Observed.MemMax = v; e.hasMemObs = true })
+	upsert(resultMap["cpuReq"], func(e *capacityObsRec, v float64) { e.rec.Current.CPUReq = v })
+	upsert(resultMap["memReq"], func(e *capacityObsRec, v float64) { e.rec.Current.MemReq = v })
+	upsert(resultMap["cpuLim"], func(e *capacityObsRec, v float64) {
+		if v > 0 {
+			e.rec.Current.CPULim = &v
+		}
+	})
+	upsert(resultMap["memLim"], func(e *capacityObsRec, v float64) { e.rec.Current.MemLim = v })
+	upsert(resultMap["throttled"], func(e *capacityObsRec, v float64) { e.rec.Observed.ThrottledRate = v })
+	return obs
+}
+
+func capacityOwnerByPod(podOwner, jobOwner []queries.PromResult) map[string]struct{ kind, name string } {
+	cronByJob := map[string]struct{ kind, name string }{}
+	for _, r := range jobOwner {
+		if r.Metric["owner_kind"] != "CronJob" {
+			continue
+		}
+		job := r.Metric["job_name"]
+		if job == "" {
+			continue
+		}
+		ns := r.Metric["namespace"]
+		cluster := r.Metric["k8s_cluster_name"]
+		cronByJob[ns+"\x00"+cluster+"\x00"+job] = struct{ kind, name string }{"CronJob", r.Metric["owner_name"]}
+	}
+	ownerByPod := map[string]struct{ kind, name string }{}
+	for _, r := range podOwner {
+		pod := r.Metric["pod"]
+		if pod == "" {
+			continue
+		}
+		ns := r.Metric["namespace"]
+		cluster := r.Metric["k8s_cluster_name"]
+		kind := r.Metric["owner_kind"]
+		name := r.Metric["owner_name"]
+		if kind == "ReplicaSet" {
+			kind = "Deployment"
+			name = stripReplicaSetHash(name)
+		}
+		if kind == "Job" {
+			if parent, ok := cronByJob[ns+"\x00"+cluster+"\x00"+name]; ok && parent.name != "" {
+				kind = parent.kind
+				name = parent.name
+			}
+		}
+		ownerByPod[ns+"\x00"+cluster+"\x00"+pod] = struct{ kind, name string }{kind, name}
+	}
+	return ownerByPod
+}
+
+func mergeCapacityByWorkload(
+	obs map[capacityPodID]*capacityObsRec,
+	ownerByPod map[string]struct{ kind, name string },
+) map[capacityWkKey]*capacityWkAgg {
+	byWorkload := map[capacityWkKey]*capacityWkAgg{}
+	for k, entry := range obs {
+		rec := entry.rec
+		owner, ok := ownerByPod[k.ns+"\x00"+k.cluster+"\x00"+k.pod]
+		if !ok || owner.name == "" {
+			owner = struct{ kind, name string }{"Pod", k.pod}
+		}
+		wkey := capacityWkKey{k.ns, owner.kind, owner.name, k.container, k.cluster}
+		agg := byWorkload[wkey]
+		if agg == nil {
+			rec.WorkloadKind = owner.kind
+			rec.WorkloadName = owner.name
+			byWorkload[wkey] = &capacityWkAgg{rec: rec, hasCPUObs: entry.hasCPUObs, hasMemObs: entry.hasMemObs}
+			continue
+		}
+		agg.rec.Replicas++
+		agg.hasCPUObs = agg.hasCPUObs || entry.hasCPUObs
+		agg.hasMemObs = agg.hasMemObs || entry.hasMemObs
+		if rec.Observed.CPUP95 > agg.rec.Observed.CPUP95 {
+			agg.rec.Observed.CPUP95 = rec.Observed.CPUP95
+		}
+		if rec.Observed.CPUMax > agg.rec.Observed.CPUMax {
+			agg.rec.Observed.CPUMax = rec.Observed.CPUMax
+		}
+		if rec.Observed.MemP95 > agg.rec.Observed.MemP95 {
+			agg.rec.Observed.MemP95 = rec.Observed.MemP95
+		}
+		if rec.Observed.MemMax > agg.rec.Observed.MemMax {
+			agg.rec.Observed.MemMax = rec.Observed.MemMax
+		}
+		// Current requests/limits stay per-replica (do not sum across pods).
+		if agg.rec.Current.CPUReq == 0 && rec.Current.CPUReq > 0 {
+			agg.rec.Current.CPUReq = rec.Current.CPUReq
+		}
+		if agg.rec.Current.MemReq == 0 && rec.Current.MemReq > 0 {
+			agg.rec.Current.MemReq = rec.Current.MemReq
+		}
+		if agg.rec.Current.MemLim == 0 && rec.Current.MemLim > 0 {
+			agg.rec.Current.MemLim = rec.Current.MemLim
+		}
+		if agg.rec.Current.CPULim == nil && rec.Current.CPULim != nil {
+			agg.rec.Current.CPULim = rec.Current.CPULim
+		}
+	}
+	return byWorkload
+}
+
+func finalizeCapacityRecommendation(agg *capacityWkAgg, cpuHour, memHour float64) (WorkloadRecommendation, bool) {
+	rec := agg.rec
+	if !agg.hasCPUObs && !agg.hasMemObs {
+		return WorkloadRecommendation{}, false
+	}
+	var cpuReq, memReq, memLim float64
+	var gCPU, gCPULim, gMem, gMemLim float64
+	if agg.hasCPUObs {
+		cpuReq, _, _ = burstableRecommendation(rec.Observed.CPUP95, 0, 0)
+		gCPU, gCPULim, _, _ = guaranteedRecommendation(rec.Observed.CPUMax, 0)
+	}
+	if agg.hasMemObs {
+		_, memReq, memLim = burstableRecommendation(0, rec.Observed.MemP95, rec.Observed.MemMax)
+		_, _, gMem, gMemLim = guaranteedRecommendation(0, rec.Observed.MemMax)
+	}
+	rec.Burstable = WorkloadResources{CPUReq: cpuReq, MemReq: memReq, MemLim: memLim}
+	gLim := gCPULim
+	guaranteed := WorkloadResources{MemReq: gMem, MemLim: gMemLim}
+	if agg.hasCPUObs {
+		guaranteed.CPUReq = gCPU
+		guaranteed.CPULim = &gLim
+	}
+	rec.Guaranteed = guaranteed
+	var curLim float64
+	if rec.Current.CPULim != nil {
+		curLim = *rec.Current.CPULim
+	}
+	rec.QoSClass = qosClass(rec.Current.CPUReq, curLim, rec.Current.MemReq, rec.Current.MemLim)
+	rec.YAMLPatch = resourcesYAMLPatchSelective(cpuReq, agg.hasCPUObs, nil, memReq, memLim, agg.hasMemObs)
+	reps := float64(rec.Replicas)
+	if reps < 1 {
+		reps = 1
+	}
+	wasteCPU := clampMin0(rec.Current.CPUReq - rec.Observed.CPUP95)
+	wasteMem := clampMin0(rec.Current.MemReq - rec.Observed.MemP95)
+	if !agg.hasCPUObs {
+		wasteCPU = 0
+	}
+	if !agg.hasMemObs {
+		wasteMem = 0
+	}
+	rec.ReclaimableMonthlyUSD = roundTo(monthlyUSD(wasteCPU*reps, wasteMem*reps, cpuHour, memHour), 2)
+	defCPU := clampMin0(rec.Observed.CPUP95 - rec.Current.CPUReq)
+	defMem := clampMin0(rec.Observed.MemP95 - rec.Current.MemReq)
+	if !agg.hasCPUObs {
+		defCPU = 0
+	}
+	if !agg.hasMemObs {
+		defMem = 0
+	}
+	rec.DeficitMonthlyUSD = roundTo(monthlyUSD(defCPU*reps, defMem*reps, cpuHour, memHour), 2)
+	return *rec, true
 }
 
 func namespaceOnlyScope(namespace string) string {

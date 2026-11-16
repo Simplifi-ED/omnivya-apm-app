@@ -1,7 +1,8 @@
-import React from 'react';
-import { useStyles2, useTheme2, Alert, Icon, Badge } from '@grafana/ui';
+import React, { useMemo } from 'react';
+import { useStyles2, useTheme2, Alert, Icon, Badge, LinkButton } from '@grafana/ui';
 import { GrafanaTheme2 } from '@grafana/data';
 import { css } from '@emotion/css';
+import { useSearchParams } from 'react-router-dom';
 import {
   getRuntimeMetrics,
   RuntimeResponse,
@@ -14,7 +15,7 @@ import {
   MemoryPool,
 } from '../../api/client';
 import { useFetch } from '../../utils/useFetch';
-import { useAppNavigate } from '../../utils/navigation';
+import { PLUGIN_BASE_URL } from '../../constants';
 import { typographyFontSize } from '../../utils/themeTypography';
 import { CardGridSkeleton } from '../../components/Skeleton';
 
@@ -440,7 +441,28 @@ function ContainerCard({
   environment?: string;
 }) {
   const styles = useStyles2(getStyles);
-  const appNavigate = useAppNavigate();
+  const [searchParams] = useSearchParams();
+  const capacityHref = useMemo(() => {
+    const params = new URLSearchParams();
+    for (const key of ['from', 'to']) {
+      const v = searchParams.get(key);
+      if (v) {
+        params.set(key, v);
+      }
+    }
+    params.set('namespace', namespace);
+    params.set('histNs', namespace);
+    params.set('capTab', 'rightsizing');
+    if (environment) {
+      params.set('environment', environment);
+    } else {
+      const env = searchParams.get('environment');
+      if (env) {
+        params.set('environment', env);
+      }
+    }
+    return `${PLUGIN_BASE_URL}/capacity?${params.toString()}`;
+  }, [searchParams, namespace, environment]);
 
   const cpuPctReq = container.cpuRequests > 0 ? (container.cpuUsage / container.cpuRequests) * 100 : 0;
   const cpuPctLim = container.cpuLimits > 0 ? (container.cpuUsage / container.cpuLimits) * 100 : 0;
@@ -462,23 +484,9 @@ function ContainerCard({
             color="red"
           />
         )}
-        <button
-          type="button"
-          className={styles.capacityLink}
-          onClick={() => {
-            const params: Record<string, string> = {
-              namespace,
-              histNs: namespace,
-              capTab: 'rightsizing',
-            };
-            if (environment) {
-              params.environment = environment;
-            }
-            appNavigate('capacity', params);
-          }}
-        >
+        <LinkButton href={capacityHref} fill="text" size="sm" className={styles.capacityLink}>
           Capacity →
-        </button>
+        </LinkButton>
       </div>
 
       <div className={styles.metricsGrid}>

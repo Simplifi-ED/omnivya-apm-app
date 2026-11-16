@@ -116,16 +116,30 @@ func formatMemoryBytes(bytes float64) string {
 }
 
 func resourcesYAMLPatch(cpuReq float64, cpuLim *float64, memReq, memLim float64) string {
+	return resourcesYAMLPatchSelective(cpuReq, true, cpuLim, memReq, memLim, true)
+}
+
+// resourcesYAMLPatchSelective emits only resources that have usage observations.
+func resourcesYAMLPatchSelective(cpuReq float64, includeCPU bool, cpuLim *float64, memReq, memLim float64, includeMem bool) string {
+	if !includeCPU && !includeMem {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString("resources:\n")
 	b.WriteString("  requests:\n")
-	fmt.Fprintf(&b, "    cpu: %q\n", formatCPUCores(cpuReq))
-	fmt.Fprintf(&b, "    memory: %q\n", formatMemoryBytes(memReq))
+	if includeCPU {
+		fmt.Fprintf(&b, "    cpu: %q\n", formatCPUCores(cpuReq))
+	}
+	if includeMem {
+		fmt.Fprintf(&b, "    memory: %q\n", formatMemoryBytes(memReq))
+	}
 	b.WriteString("  limits:\n")
-	if cpuLim != nil {
+	if includeCPU && cpuLim != nil {
 		fmt.Fprintf(&b, "    cpu: %q\n", formatCPUCores(*cpuLim))
 	}
-	fmt.Fprintf(&b, "    memory: %q\n", formatMemoryBytes(memLim))
+	if includeMem {
+		fmt.Fprintf(&b, "    memory: %q\n", formatMemoryBytes(memLim))
+	}
 	return b.String()
 }
 

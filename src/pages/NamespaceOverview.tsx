@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { PluginPage } from '@grafana/runtime';
 import { IconButton, MultiCombobox, useStyles2 } from '@grafana/ui';
@@ -140,9 +140,12 @@ function NamespaceOverview() {
 
   const teamFilters = useMemo(() => searchParams.getAll('team').filter(Boolean), [searchParams]);
 
+  const [capacityRefreshKey, setCapacityRefreshKey] = useState(0);
+
   // Auto-refresh. For relative ranges (now-1h), re-resolving the range updates
   // fromMs/toMs and every time-scoped useFetch above refetches via its deps.
   // Alerts have no time-range dependency, so they are refetched explicitly.
+  // Absolute ranges also bump capacityRefreshKey so NamespaceCapacityBlock refetches.
   const handleRefresh = useCallback(() => {
     refetchAlerts();
     if (isRelativeRange) {
@@ -156,6 +159,7 @@ function NamespaceOverview() {
     refetchIssuesAttention();
     refetchNsScorecard();
     refetchNsOwnership();
+    setCapacityRefreshKey((n) => n + 1);
   }, [
     isRelativeRange,
     refreshTimeRange,
@@ -359,6 +363,7 @@ function NamespaceOverview() {
             environment={envFilters.length === 1 ? envFilters[0] : envFilters.join(',') || undefined}
             fromMs={fromMs}
             toMs={toMs}
+            refreshKey={capacityRefreshKey}
           />
 
           {!nsOwnershipLoading && nsOwnership && nsOwnership.total > 0 && (

@@ -13,6 +13,8 @@ interface NamespaceCapacityBlockProps {
   environment?: string;
   fromMs: number;
   toMs: number;
+  /** Bumped on absolute-range refresh so capacity refetches without time change. */
+  refreshKey?: number;
 }
 
 function formatUsd(v: number): string {
@@ -22,12 +24,18 @@ function formatUsd(v: number): string {
   return `$${v.toFixed(0)}`;
 }
 
-export function NamespaceCapacityBlock({ namespace, environment, fromMs, toMs }: NamespaceCapacityBlockProps) {
+export function NamespaceCapacityBlock({
+  namespace,
+  environment,
+  fromMs,
+  toMs,
+  refreshKey = 0,
+}: NamespaceCapacityBlockProps) {
   const styles = useStyles2(getStyles);
   const appNavigate = useAppNavigate();
   const { data, loading, error } = useFetch<CapacityOverview>(
     () => getNamespaceCapacity(namespace, fromMs, toMs, environment),
-    [namespace, environment, fromMs, toMs]
+    [namespace, environment, fromMs, toMs, refreshKey]
   );
 
   if (loading) {

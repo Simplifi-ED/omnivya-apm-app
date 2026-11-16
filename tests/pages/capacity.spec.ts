@@ -27,9 +27,9 @@ test.describe('Capacity', () => {
     await expect(chrome.first()).toBeVisible({ timeout: 15_000 });
 
     await expect(page.getByRole('tab', { name: /Overview/i }).first()).toBeVisible({ timeout: 15_000 });
+    await expect(page.getByRole('tab', { name: /Namespaces/i }).first()).toBeVisible();
+    await expect(page.getByRole('tab', { name: /Nodes/i }).first()).toBeVisible();
     await expect(page.getByRole('tab', { name: /Right-sizing/i }).first()).toBeVisible();
-    await expect(page.getByRole('tab', { name: /History/i }).first()).toBeVisible();
-    await expect(page.getByRole('tab', { name: /Forecast/i }).first()).toBeVisible();
   });
 
   test('right-sizing tab switches without blanking the page', async ({ page }) => {
