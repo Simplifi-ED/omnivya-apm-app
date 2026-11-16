@@ -67,12 +67,13 @@ and follow the same stability promise as the shared params above.
 
 ### Capacity (`/capacity`)
 
-| Param         | Values                                                   | Meaning                                              |
-| ------------- | -------------------------------------------------------- | ---------------------------------------------------- |
-| `namespace`   | namespace name                                           | Optional fleet filter.                               |
-| `environment` | cluster name                                             | Same as shared `environment`.                        |
-| `capTab`      | `overview` \| `rightsizing` \| `history` \| `forecast`   | Active Capacity tab (`overview` when omitted).       |
-| `histNs`      | namespace name                                           | Namespace for History / Forecast tabs.               |
+| Param         | Values                                                         | Meaning                                              |
+| ------------- | -------------------------------------------------------------- | ---------------------------------------------------- |
+| `namespace`   | namespace name                                                 | Optional fleet filter (Combobox).                    |
+| `environment` | cluster name                                                   | Same as shared `environment` (Combobox).             |
+| `capTab`      | `overview` \| `namespaces` \| `nodes` \| `rightsizing`         | Active Capacity tab (`overview` when omitted).       |
+
+Predict opens as a drawer from a namespace/node row (Combobox scope). History/Forecast tabs and `histNs` are removed.
 
 ### Issues tab facets (`tab=issues`)
 

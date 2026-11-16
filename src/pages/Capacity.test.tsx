@@ -40,6 +40,7 @@ jest.mock('../api/capacity', () => ({
       reservedWithoutUsage: 0,
     },
     namespaces: [],
+    nodes: [],
     topWasteCpu: [],
     topWasteMem: [],
     topRiskContainers: [],
@@ -56,15 +57,19 @@ jest.mock('../api/capacity', () => ({
 }));
 
 describe('Capacity page', () => {
-  it('shows Jobs-style toolbar and enablement empty state', async () => {
+  it('shows Efficiency IA tabs and enablement empty state', async () => {
     render(
       <MemoryRouter initialEntries={['/a/omnivya-apm-app/capacity']}>
         <Capacity />
       </MemoryRouter>
     );
-    expect(screen.getByLabelText('Filter namespace')).toBeInTheDocument();
     expect(screen.getByTestId('time-controls')).toBeInTheDocument();
     expect(screen.getByRole('tab', { name: 'Overview' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Namespaces' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Nodes' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Right-sizing' })).toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: 'History' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('tab', { name: 'Forecast' })).not.toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByText('Capacity metrics unavailable')).toBeInTheDocument();
     });

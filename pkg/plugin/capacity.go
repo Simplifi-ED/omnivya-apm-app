@@ -66,11 +66,61 @@ type CapacityNamespaceRollup struct {
 	Environment           string  `json:"environment,omitempty"`
 	WasteCPU              float64 `json:"wasteCpu"`
 	WasteMem              float64 `json:"wasteMem"`
+	CPUUsage              float64 `json:"cpuUsage,omitempty"`
+	CPURequest            float64 `json:"cpuRequest,omitempty"`
+	MemUsage              float64 `json:"memUsage,omitempty"`
+	MemRequest            float64 `json:"memRequest,omitempty"`
+	CPUUsedRatio          float64 `json:"cpuUsedRatio,omitempty"`
+	MemUsedRatio          float64 `json:"memUsedRatio,omitempty"`
 	ReclaimableMonthlyUSD float64 `json:"reclaimableMonthlyUsd"`
 	MissingRequest        int     `json:"missingRequest"`
 	MissingLimit          int     `json:"missingLimit"`
 	UnderProvisioned      int     `json:"underProvisioned"`
 	Throttled             int     `json:"throttled"`
+}
+
+// CapacityEfficiencyBand is under/ok/over share of a population (fractions 0..1).
+type CapacityEfficiencyBand struct {
+	Under float64 `json:"under"`
+	OK    float64 `json:"ok"`
+	Over  float64 `json:"over"`
+}
+
+// CapacityResourcePopulation is CPU/mem/storage band shares for one scope.
+type CapacityResourcePopulation struct {
+	CPU     CapacityEfficiencyBand  `json:"cpu"`
+	Mem     CapacityEfficiencyBand  `json:"mem"`
+	Storage *CapacityEfficiencyBand `json:"storage,omitempty"` // nil until fs series present
+}
+
+// CapacityPopulationScope is one Efficiency card (cluster/node/namespace).
+type CapacityPopulationScope struct {
+	Total int                        `json:"total"`
+	Bands CapacityResourcePopulation `json:"bands"`
+}
+
+// CapacityPopulation powers Overview Efficiency cards.
+type CapacityPopulation struct {
+	Clusters   CapacityPopulationScope `json:"clusters"`
+	Nodes      CapacityPopulationScope `json:"nodes"`
+	Namespaces CapacityPopulationScope `json:"namespaces"`
+}
+
+// CapacityNodeRollup is one node row for the Nodes tab.
+type CapacityNodeRollup struct {
+	Node           string   `json:"node"`
+	Environment    string   `json:"environment,omitempty"`
+	CPUUsage       float64  `json:"cpuUsage"`
+	CPUAlloc       float64  `json:"cpuAlloc"`
+	CPUUsedRatio   float64  `json:"cpuUsedRatio,omitempty"`
+	MemUsage       float64  `json:"memUsage"`
+	MemAlloc       float64  `json:"memAlloc"`
+	MemUsedRatio   float64  `json:"memUsedRatio,omitempty"`
+	StorageUsage   *float64 `json:"storageUsage,omitempty"`
+	StorageLimit   *float64 `json:"storageLimit,omitempty"`
+	StorageRatio   *float64 `json:"storageRatio,omitempty"`
+	PodCount       int      `json:"podCount,omitempty"`
+	ConditionReady bool     `json:"conditionReady"`
 }
 
 // CapacityContainerRow is a ranked container waste or risk entry.
@@ -94,8 +144,10 @@ type CapacityOverview struct {
 	Available         bool                      `json:"available"`
 	EnablementNote    string                    `json:"enablementNote,omitempty"`
 	Efficiency        CapacityEfficiency        `json:"efficiency"`
+	Population        CapacityPopulation        `json:"population"`
 	GapCounts         CapacityGapCounts         `json:"gapCounts"`
 	Namespaces        []CapacityNamespaceRollup `json:"namespaces"`
+	Nodes             []CapacityNodeRollup      `json:"nodes"`
 	TopWasteCPU       []CapacityContainerRow    `json:"topWasteCpu"`
 	TopWasteMem       []CapacityContainerRow    `json:"topWasteMem"`
 	TopRiskContainers []CapacityContainerRow    `json:"topRiskContainers"`
@@ -406,6 +458,17 @@ func (a *App) queryCapacityProm(ctx context.Context, namespace, env string, at t
 		{"throttled", capacityThrottledContainers(ctr, scope)},
 		{"allocCpu", fmt.Sprintf(`sum(%s{%s="cpu"})`, ctr.NodeAllocatable, ctr.ResourceLabel)},
 		{"allocMem", fmt.Sprintf(`sum(%s{%s="memory"})`, ctr.NodeAllocatable, ctr.ResourceLabel)},
+		{"nsCpuUsage", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, cpuUsage)},
+		{"nsMemUsage", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, memUsage)},
+		{"nsCpuReq", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, cpuReq)},
+		{"nsMemReq", fmt.Sprintf(`sum by (namespace, k8s_cluster_name) (%s)`, memReq)},
+		{"nodeCpuUsage", fmt.Sprintf(`sum by (node, kubernetes_io_hostname, instance) (%s)`, cpuUsage)},
+		{"nodeMemUsage", fmt.Sprintf(`sum by (node, kubernetes_io_hostname, instance) (%s)`, memUsage)},
+		{"nodeCpuAlloc", fmt.Sprintf(`sum by (node) (%s{%s="cpu"})`, ctr.NodeAllocatable, ctr.ResourceLabel)},
+		{"nodeMemAlloc", fmt.Sprintf(`sum by (node) (%s{%s="memory"})`, ctr.NodeAllocatable, ctr.ResourceLabel)},
+		// Root-cgroup fs (container=""); soft-null in UI when series absent — never invent from KSM capacity alone.
+		{"nodeFsUsage", `sum by (node, kubernetes_io_hostname, instance) (container_fs_usage_bytes{container="",id="/"})`},
+		{"nodeFsLimit", `sum by (node, kubernetes_io_hostname, instance) (container_fs_limit_bytes{container="",id="/"})`},
 	}
 
 	resultMap := a.runInstantQueries(ctx, at, jobs, logger)
@@ -433,6 +496,7 @@ func (a *App) aggregateCapacity(resultMap map[string][]queries.PromResult) Capac
 			Available:         false,
 			EnablementNote:    capacityEnablementNote,
 			Namespaces:        []CapacityNamespaceRollup{},
+			Nodes:             []CapacityNodeRollup{},
 			TopWasteCPU:       []CapacityContainerRow{},
 			TopWasteMem:       []CapacityContainerRow{},
 			TopRiskContainers: []CapacityContainerRow{},
@@ -461,42 +525,57 @@ func (a *App) aggregateCapacity(resultMap map[string][]queries.PromResult) Capac
 	}
 
 	nsMap := map[string]*CapacityNamespaceRollup{}
+	nsKey := func(ns, env string) string {
+		if env == "" {
+			return ns
+		}
+		return env + "\x00" + ns
+	}
+	ensureNs := func(ns, env string) *CapacityNamespaceRollup {
+		k := nsKey(ns, env)
+		row := nsMap[k]
+		if row == nil {
+			row = &CapacityNamespaceRollup{Namespace: ns, Environment: env}
+			nsMap[k] = row
+		} else if row.Environment == "" && env != "" {
+			row.Environment = env
+		}
+		return row
+	}
 	for _, r := range resultMap["wasteCpuNs"] {
 		ns := r.Metric["namespace"]
 		if ns == "" {
 			continue
 		}
-		row := nsMap[ns]
-		if row == nil {
-			row = &CapacityNamespaceRollup{Namespace: ns, Environment: r.Metric["k8s_cluster_name"]}
-			nsMap[ns] = row
-		}
-		row.WasteCPU = roundTo(safeFloat(r.Value.Float()), 4)
+		ensureNs(ns, r.Metric["k8s_cluster_name"]).WasteCPU = roundTo(safeFloat(r.Value.Float()), 4)
 	}
 	for _, r := range resultMap["wasteMemNs"] {
 		ns := r.Metric["namespace"]
 		if ns == "" {
 			continue
 		}
-		row := nsMap[ns]
-		if row == nil {
-			row = &CapacityNamespaceRollup{Namespace: ns, Environment: r.Metric["k8s_cluster_name"]}
-			nsMap[ns] = row
-		}
-		row.WasteMem = roundTo(safeFloat(r.Value.Float()), 0)
+		ensureNs(ns, r.Metric["k8s_cluster_name"]).WasteMem = roundTo(safeFloat(r.Value.Float()), 0)
 	}
+	applyNsMetric := func(key string, set func(*CapacityNamespaceRollup, float64)) {
+		for _, r := range resultMap[key] {
+			ns := r.Metric["namespace"]
+			if ns == "" {
+				continue
+			}
+			set(ensureNs(ns, r.Metric["k8s_cluster_name"]), safeFloat(r.Value.Float()))
+		}
+	}
+	applyNsMetric("nsCpuUsage", func(row *CapacityNamespaceRollup, v float64) { row.CPUUsage = roundTo(v, 4) })
+	applyNsMetric("nsMemUsage", func(row *CapacityNamespaceRollup, v float64) { row.MemUsage = roundTo(v, 0) })
+	applyNsMetric("nsCpuReq", func(row *CapacityNamespaceRollup, v float64) { row.CPURequest = roundTo(v, 4) })
+	applyNsMetric("nsMemReq", func(row *CapacityNamespaceRollup, v float64) { row.MemRequest = roundTo(v, 0) })
 
 	addGapCount := func(key string, set func(*CapacityNamespaceRollup, int), fleet *int) {
 		for _, r := range resultMap[key] {
 			n := int(safeFloat(r.Value.Float()))
 			*fleet += n
 			if ns := r.Metric["namespace"]; ns != "" {
-				row := nsMap[ns]
-				if row == nil {
-					row = &CapacityNamespaceRollup{Namespace: ns}
-					nsMap[ns] = row
-				}
-				set(row, n)
+				set(ensureNs(ns, r.Metric["k8s_cluster_name"]), n)
 			}
 		}
 	}
@@ -519,6 +598,12 @@ func (a *App) aggregateCapacity(resultMap map[string][]queries.PromResult) Capac
 	namespaces := make([]CapacityNamespaceRollup, 0, len(nsMap))
 	for _, row := range nsMap {
 		row.ReclaimableMonthlyUSD = roundTo(monthlyUSD(row.WasteCPU, row.WasteMem, cpuHour, memHour), 2)
+		if row.CPURequest > 0 {
+			row.CPUUsedRatio = roundTo(row.CPUUsage/row.CPURequest, 4)
+		}
+		if row.MemRequest > 0 {
+			row.MemUsedRatio = roundTo(row.MemUsage/row.MemRequest, 4)
+		}
 		totalWasteCPU += row.WasteCPU
 		totalWasteMem += row.WasteMem
 		namespaces = append(namespaces, *row)
@@ -539,15 +624,205 @@ func (a *App) aggregateCapacity(resultMap map[string][]queries.PromResult) Capac
 	gaps.OverRequestedMem = len(topMem)
 
 	risk := riskRowsFromResults(resultMap["underCpu"], resultMap["underMem"], resultMap["throttled"])
+	nodes := buildCapacityNodes(resultMap)
+	population := buildCapacityPopulation(namespaces, nodes)
 
 	return CapacityOverview{
 		Available:         true,
 		Efficiency:        eff,
+		Population:        population,
 		GapCounts:         gaps,
 		Namespaces:        namespaces,
+		Nodes:             nodes,
 		TopWasteCPU:       topCPU,
 		TopWasteMem:       topMem,
 		TopRiskContainers: risk,
+	}
+}
+
+func capacityNodeName(m map[string]string) string {
+	for _, k := range []string{"node", "kubernetes_io_hostname", "instance"} {
+		if v := m[k]; v != "" {
+			// strip :port from instance
+			if k == "instance" {
+				if i := strings.LastIndex(v, ":"); i > 0 {
+					return v[:i]
+				}
+			}
+			return v
+		}
+	}
+	return ""
+}
+
+func buildCapacityNodes(resultMap map[string][]queries.PromResult) []CapacityNodeRollup {
+	type agg struct {
+		env                                        string
+		cpuUsage, memUsage                         float64
+		cpuAlloc, memAlloc                         float64
+		fsUsage, fsLimit                           float64
+		hasUsage, hasAlloc, hasFsUsage, hasFsLimit bool
+	}
+	byNode := map[string]*agg{}
+	ensure := func(name, env string) *agg {
+		a := byNode[name]
+		if a == nil {
+			a = &agg{env: env}
+			byNode[name] = a
+		} else if a.env == "" && env != "" {
+			a.env = env
+		}
+		return a
+	}
+	for _, r := range resultMap["nodeCpuUsage"] {
+		if n := capacityNodeName(r.Metric); n != "" {
+			a := ensure(n, r.Metric["k8s_cluster_name"])
+			a.cpuUsage += safeFloat(r.Value.Float())
+			a.hasUsage = true
+		}
+	}
+	for _, r := range resultMap["nodeMemUsage"] {
+		if n := capacityNodeName(r.Metric); n != "" {
+			a := ensure(n, r.Metric["k8s_cluster_name"])
+			a.memUsage += safeFloat(r.Value.Float())
+			a.hasUsage = true
+		}
+	}
+	for _, r := range resultMap["nodeCpuAlloc"] {
+		if n := capacityNodeName(r.Metric); n != "" {
+			a := ensure(n, r.Metric["k8s_cluster_name"])
+			a.cpuAlloc += safeFloat(r.Value.Float())
+			a.hasAlloc = true
+		}
+	}
+	for _, r := range resultMap["nodeMemAlloc"] {
+		if n := capacityNodeName(r.Metric); n != "" {
+			a := ensure(n, r.Metric["k8s_cluster_name"])
+			a.memAlloc += safeFloat(r.Value.Float())
+			a.hasAlloc = true
+		}
+	}
+	for _, r := range resultMap["nodeFsUsage"] {
+		if n := capacityNodeName(r.Metric); n != "" {
+			a := ensure(n, r.Metric["k8s_cluster_name"])
+			a.fsUsage += safeFloat(r.Value.Float())
+			a.hasFsUsage = true
+		}
+	}
+	for _, r := range resultMap["nodeFsLimit"] {
+		if n := capacityNodeName(r.Metric); n != "" {
+			a := ensure(n, r.Metric["k8s_cluster_name"])
+			a.fsLimit += safeFloat(r.Value.Float())
+			a.hasFsLimit = true
+		}
+	}
+	out := make([]CapacityNodeRollup, 0, len(byNode))
+	for name, a := range byNode {
+		row := CapacityNodeRollup{
+			Node: name, Environment: a.env,
+			CPUUsage: roundTo(a.cpuUsage, 4), MemUsage: roundTo(a.memUsage, 0),
+			CPUAlloc: roundTo(a.cpuAlloc, 4), MemAlloc: roundTo(a.memAlloc, 0),
+			ConditionReady: true,
+		}
+		if a.cpuAlloc > 0 {
+			row.CPUUsedRatio = roundTo(a.cpuUsage/a.cpuAlloc, 4)
+		}
+		if a.memAlloc > 0 {
+			row.MemUsedRatio = roundTo(a.memUsage/a.memAlloc, 4)
+		}
+		if a.hasFsUsage {
+			u := roundTo(a.fsUsage, 0)
+			row.StorageUsage = &u
+		}
+		if a.hasFsLimit {
+			l := roundTo(a.fsLimit, 0)
+			row.StorageLimit = &l
+		}
+		if a.hasFsUsage && a.hasFsLimit && a.fsLimit > 0 {
+			r := roundTo(a.fsUsage/a.fsLimit, 4)
+			row.StorageRatio = &r
+		}
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Node < out[j].Node })
+	return out
+}
+
+func fractionsToBand(f EfficiencyBandFractions) CapacityEfficiencyBand {
+	return CapacityEfficiencyBand(f)
+}
+
+func buildCapacityPopulation(namespaces []CapacityNamespaceRollup, nodes []CapacityNodeRollup) CapacityPopulation {
+	var nsCPUUnder, nsCPUOK, nsCPUOver, nsMemUnder, nsMemOK, nsMemOver int
+	clusterCPU := map[string]struct{ used, req float64 }{}
+	clusterMem := map[string]struct{ used, req float64 }{}
+	for _, ns := range namespaces {
+		accumulateBandClass(classifyUsedRatio(ns.CPUUsage, ns.CPURequest), &nsCPUUnder, &nsCPUOK, &nsCPUOver)
+		accumulateBandClass(classifyUsedRatio(ns.MemUsage, ns.MemRequest), &nsMemUnder, &nsMemOK, &nsMemOver)
+		env := ns.Environment
+		if env == "" {
+			env = "_default"
+		}
+		c := clusterCPU[env]
+		c.used += ns.CPUUsage
+		c.req += ns.CPURequest
+		clusterCPU[env] = c
+		m := clusterMem[env]
+		m.used += ns.MemUsage
+		m.req += ns.MemRequest
+		clusterMem[env] = m
+	}
+	var clCPUUnder, clCPUOK, clCPUOver, clMemUnder, clMemOK, clMemOver int
+	for env, c := range clusterCPU {
+		accumulateBandClass(classifyUsedRatio(c.used, c.req), &clCPUUnder, &clCPUOK, &clCPUOver)
+		m := clusterMem[env]
+		accumulateBandClass(classifyUsedRatio(m.used, m.req), &clMemUnder, &clMemOK, &clMemOver)
+	}
+	var nCPUUnder, nCPUOK, nCPUOver, nMemUnder, nMemOK, nMemOver int
+	var nStorUnder, nStorOK, nStorOver int
+	var hasNodeStorage bool
+	for _, n := range nodes {
+		accumulateBandClass(classifyUsedRatio(n.CPUUsage, n.CPUAlloc), &nCPUUnder, &nCPUOK, &nCPUOver)
+		accumulateBandClass(classifyUsedRatio(n.MemUsage, n.MemAlloc), &nMemUnder, &nMemOK, &nMemOver)
+		if n.StorageUsage != nil && n.StorageLimit != nil && *n.StorageLimit > 0 {
+			hasNodeStorage = true
+			accumulateBandClass(classifyUsedRatio(*n.StorageUsage, *n.StorageLimit), &nStorUnder, &nStorOK, &nStorOver)
+		}
+	}
+	clusterTotal := len(clusterCPU)
+	if clusterTotal == 0 && len(namespaces) > 0 {
+		clusterTotal = 1
+	}
+	var nodeStorage *CapacityEfficiencyBand
+	if hasNodeStorage {
+		b := fractionsToBand(bandFractionsFromCounts(nStorUnder, nStorOK, nStorOver))
+		nodeStorage = &b
+	}
+	return CapacityPopulation{
+		Clusters: CapacityPopulationScope{
+			Total: clusterTotal,
+			Bands: CapacityResourcePopulation{
+				CPU:     fractionsToBand(bandFractionsFromCounts(clCPUUnder, clCPUOK, clCPUOver)),
+				Mem:     fractionsToBand(bandFractionsFromCounts(clMemUnder, clMemOK, clMemOver)),
+				Storage: nodeStorage, // cluster storage mirrors node fs until PVC bands exist
+			},
+		},
+		Nodes: CapacityPopulationScope{
+			Total: len(nodes),
+			Bands: CapacityResourcePopulation{
+				CPU:     fractionsToBand(bandFractionsFromCounts(nCPUUnder, nCPUOK, nCPUOver)),
+				Mem:     fractionsToBand(bandFractionsFromCounts(nMemUnder, nMemOK, nMemOver)),
+				Storage: nodeStorage,
+			},
+		},
+		Namespaces: CapacityPopulationScope{
+			Total: len(namespaces),
+			Bands: CapacityResourcePopulation{
+				CPU: fractionsToBand(bandFractionsFromCounts(nsCPUUnder, nsCPUOK, nsCPUOver)),
+				Mem: fractionsToBand(bandFractionsFromCounts(nsMemUnder, nsMemOK, nsMemOver)),
+				// Namespace storage stays null until PVC/fs-by-ns series exist.
+			},
+		},
 	}
 }
 
@@ -561,6 +836,7 @@ func (a *App) capacityEmptyOverview(note string) CapacityOverview {
 		Available:         false,
 		EnablementNote:    note,
 		Namespaces:        []CapacityNamespaceRollup{},
+		Nodes:             []CapacityNodeRollup{},
 		TopWasteCPU:       []CapacityContainerRow{},
 		TopWasteMem:       []CapacityContainerRow{},
 		TopRiskContainers: []CapacityContainerRow{},
@@ -613,7 +889,18 @@ func (a *App) queryCapacityClickHouse(ctx context.Context, ch *queries.ClickHous
 		logger.Warn("capacity CH allocatable optional query failed", "error", aerr)
 	}
 
-	return a.aggregateCapacity(chquery.CapacityLedgerToResultMap(rows, allocCPU, allocMem))
+	rm := chquery.CapacityLedgerToResultMap(rows, allocCPU, allocMem)
+	if nodeAlloc, nerr := ch.Query(ctx, chquery.CapacityNodeAllocSQL(env, from, at), opts); nerr == nil {
+		chquery.MergeNodeAllocIntoResultMap(rm, nodeAlloc.Maps())
+	} else {
+		logger.Warn("capacity CH node allocatable optional query failed", "error", nerr)
+	}
+	if nodeFs, ferr := ch.Query(ctx, chquery.CapacityNodeFsSQL(env, from, at), opts); ferr == nil {
+		chquery.MergeNodeFsIntoResultMap(rm, nodeFs.Maps())
+	} else {
+		logger.Warn("capacity CH node filesystem optional query failed", "error", ferr)
+	}
+	return a.aggregateCapacity(rm)
 }
 
 // ---------------------------------------------------------------------------
@@ -702,10 +989,15 @@ func countContainerGaps(
 			continue
 		}
 		*fleet++
-		row := nsMap[ns]
+		env := r.Metric["k8s_cluster_name"]
+		k := ns
+		if env != "" {
+			k = env + "\x00" + ns
+		}
+		row := nsMap[k]
 		if row == nil {
-			row = &CapacityNamespaceRollup{Namespace: ns}
-			nsMap[ns] = row
+			row = &CapacityNamespaceRollup{Namespace: ns, Environment: env}
+			nsMap[k] = row
 		}
 		bumpNs(row)
 	}

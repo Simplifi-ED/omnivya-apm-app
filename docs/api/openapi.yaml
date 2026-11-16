@@ -1864,8 +1864,10 @@ components:
         available: { type: boolean }
         enablementNote: { type: string }
         efficiency: { type: object }
+        population: { type: object, description: "Efficiency under/ok/over bands for clusters, nodes, namespaces" }
         gapCounts: { type: object }
         namespaces: { type: array, items: { type: object } }
+        nodes: { type: array, items: { type: object }, description: "Per-node usage vs allocatable; storage optional" }
         topWasteCpu: { type: array, items: { type: object } }
         topWasteMem: { type: array, items: { type: object } }
         topRiskContainers: { type: array, items: { type: object } }

@@ -156,3 +156,22 @@ func TestLinearForecast(t *testing.T) {
 		t.Fatal("single point must fail")
 	}
 }
+
+func TestCapacityNodeFsSQLAndMerge(t *testing.T) {
+	sql := CapacityNodeFsSQL("prod", time.Now().Add(-time.Hour), time.Now())
+	for _, want := range []string{MetricContainerFSUsage, MetricContainerFSLimit, "usage_bytes", "limit_bytes"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("fs SQL missing %q\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "kube_node_status_capacity") {
+		t.Fatal("must not invent usage from capacity-only KSM")
+	}
+	rm := emptyCapacityResultMap()
+	MergeNodeFsIntoResultMap(rm, []map[string]any{
+		{"node": "n1", "usage_bytes": 50.0, "limit_bytes": 100.0},
+	})
+	if len(rm["nodeFsUsage"]) != 1 || len(rm["nodeFsLimit"]) != 1 {
+		t.Fatalf("merge: %+v", rm)
+	}
+}

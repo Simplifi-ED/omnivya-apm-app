@@ -159,3 +159,66 @@ func qosClass(cpuReq, cpuLim, memReq, memLim float64) string {
 	}
 	return "BestEffort"
 }
+
+// Efficiency band thresholds (Grafana Efficiency-style population cards).
+const (
+	capacityBandUnderMax = 0.40
+	capacityBandOverMin  = 0.80
+)
+
+// CapacityBandClass is under | ok | over | "" when capacity is missing.
+type CapacityBandClass string
+
+// Band class labels used by classifyUsedRatio / population aggregation.
+const (
+	CapacityBandUnder CapacityBandClass = "under"
+	CapacityBandOK    CapacityBandClass = "ok"
+	CapacityBandOver  CapacityBandClass = "over"
+)
+
+// classifyUsedRatio maps used/capacity into under/ok/over.
+// Over when ratio > 80% or used > capacity. Under when ratio < 40%.
+func classifyUsedRatio(used, capacity float64) CapacityBandClass {
+	if capacity <= 0 || math.IsNaN(used) || math.IsNaN(capacity) {
+		return ""
+	}
+	r := used / capacity
+	if used > capacity || r > capacityBandOverMin {
+		return CapacityBandOver
+	}
+	if r < capacityBandUnderMax {
+		return CapacityBandUnder
+	}
+	return CapacityBandOK
+}
+
+// EfficiencyBandFractions is under/ok/over share of a population (0..1).
+type EfficiencyBandFractions struct {
+	Under float64
+	OK    float64
+	Over  float64
+}
+
+func bandFractionsFromCounts(under, ok, over int) EfficiencyBandFractions {
+	total := under + ok + over
+	if total == 0 {
+		return EfficiencyBandFractions{}
+	}
+	t := float64(total)
+	return EfficiencyBandFractions{
+		Under: roundTo(float64(under)/t, 4),
+		OK:    roundTo(float64(ok)/t, 4),
+		Over:  roundTo(float64(over)/t, 4),
+	}
+}
+
+func accumulateBandClass(c CapacityBandClass, under, ok, over *int) {
+	switch c {
+	case CapacityBandUnder:
+		*under++
+	case CapacityBandOK:
+		*ok++
+	case CapacityBandOver:
+		*over++
+	}
+}

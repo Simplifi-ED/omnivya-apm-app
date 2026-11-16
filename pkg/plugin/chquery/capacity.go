@@ -17,6 +17,8 @@ const (
 	MetricContainerCPUUsage         = "container_cpu_usage_seconds_total"
 	MetricContainerMemoryWorkingSet = "container_memory_working_set_bytes"
 	MetricContainerCPUThrottled     = "container_cpu_cfs_throttled_seconds_total"
+	MetricContainerFSUsage          = "container_fs_usage_bytes"
+	MetricContainerFSLimit          = "container_fs_limit_bytes"
 	MetricKubePodResourceRequests   = "kube_pod_container_resource_requests"
 	MetricKubePodResourceLimits     = "kube_pod_container_resource_limits"
 	MetricKubeNodeAllocatable       = "kube_node_status_allocatable"
@@ -33,6 +35,7 @@ type CapacityContainerIdentity struct {
 	Pod         string
 	Container   string
 	Cluster     string
+	Node        string
 	UsageCPU    float64 // cores (rate over lookback)
 	UsageMem    float64 // bytes
 	ReqCPU      float64
@@ -47,6 +50,16 @@ type CapacityContainerIdentity struct {
 	HasLimCPU   bool
 	HasLimMem   bool
 	HasThrottle bool
+}
+
+func capacityNodeExpr() string {
+	return `coalesce(
+    nullIf(Attributes['node'], ''),
+    nullIf(Attributes['kubernetes_io_hostname'], ''),
+    nullIf(ResourceAttributes['k8s.node.name'], ''),
+    nullIf(ResourceAttributes['host.name'], ''),
+    ''
+  )`
 }
 
 func capacityClusterExpr() string {
@@ -154,6 +167,7 @@ func CapacityLedgerSQL(namespace, env string, from, to time.Time) string {
 	podE := capacityPodExpr()
 	ctrE := capacityContainerExpr()
 	clE := capacityClusterExpr()
+	nodeE := capacityNodeExpr()
 	win := float64(CapacityUsageLookbackSec)
 	if d := to.Sub(from).Seconds(); d > 1 {
 		win = d
@@ -165,6 +179,7 @@ SELECT
   pod,
   container,
   k8s_cluster_name,
+  node,
   greatest(
     maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s),
     0
@@ -191,6 +206,7 @@ FROM (
     %s AS pod,
     %s AS container,
     %s AS k8s_cluster_name,
+    %s AS node,
     MetricName,
     TimeUnix,
     Value,
@@ -204,6 +220,7 @@ FROM (
     %s AS pod,
     %s AS container,
     %s AS k8s_cluster_name,
+    %s AS node,
     MetricName,
     TimeUnix,
     Value,
@@ -212,7 +229,7 @@ FROM (
   WHERE MetricName IN (%s, %s, %s)
     AND %s AND (%s) AND (%s) AND (%s)
 )
-GROUP BY namespace, pod, container, k8s_cluster_name
+GROUP BY namespace, pod, container, k8s_cluster_name, node
 HAVING container != '' AND container != 'POD'
 LIMIT 10000`,
 		q(MetricContainerCPUUsage), q(MetricContainerCPUUsage), win,
@@ -229,14 +246,77 @@ LIMIT 10000`,
 		q(MetricKubePodResourceLimits),
 		q(MetricKubePodResourceLimits),
 		q(MetricContainerCPUThrottled),
-		nsE, podE, ctrE, clE,
+		nsE, podE, ctrE, clE, nodeE,
 		table(queries.CHTableMetricsSum),
 		q(MetricContainerCPUUsage), q(MetricContainerCPUThrottled),
 		tf, nsF, envF, ctrX,
-		nsE, podE, ctrE, clE,
+		nsE, podE, ctrE, clE, nodeE,
 		table(queries.CHTableMetricsGauge),
 		q(MetricContainerMemoryWorkingSet), q(MetricKubePodResourceRequests), q(MetricKubePodResourceLimits),
 		tf, nsF, envF, ctrX,
+	)
+}
+
+// CapacityNodeAllocSQL returns per-node allocatable CPU/memory.
+func CapacityNodeAllocSQL(env string, from, to time.Time) string {
+	return fmt.Sprintf(`
+SELECT
+  node,
+  sumIf(v, resource = 'cpu') AS alloc_cpu,
+  sumIf(v, resource = 'memory') AS alloc_mem
+FROM (
+  SELECT
+    Attributes['resource'] AS resource,
+    %s AS node,
+    argMax(Value, TimeUnix) AS v
+  FROM %s
+  WHERE MetricName = %s
+    AND %s
+    AND (%s)
+  GROUP BY resource, node
+)
+WHERE node != ''
+GROUP BY node
+LIMIT 500`,
+		capacityNodeExpr(),
+		table(queries.CHTableMetricsGauge),
+		q(MetricKubeNodeAllocatable),
+		MetricTimeFilter(from, to),
+		capacityEnvFilter(env),
+	)
+}
+
+// CapacityNodeFsSQL returns per-node root-cgroup filesystem usage/limit (when scraped).
+// Prefer id="/" (node root); fall back to any empty-container series. Never invent from capacity-only KSM.
+func CapacityNodeFsSQL(env string, from, to time.Time) string {
+	return fmt.Sprintf(`
+SELECT
+  node,
+  if(usage_root > 0, usage_root, usage_any) AS usage_bytes,
+  if(limit_root > 0, limit_root, limit_any) AS limit_bytes
+FROM (
+  SELECT
+    %s AS node,
+    argMaxIf(Value, TimeUnix, MetricName = %s AND coalesce(Attributes['id'], '') = '/') AS usage_root,
+    argMaxIf(Value, TimeUnix, MetricName = %s AND coalesce(Attributes['id'], '') = '/') AS limit_root,
+    argMaxIf(Value, TimeUnix, MetricName = %s) AS usage_any,
+    argMaxIf(Value, TimeUnix, MetricName = %s) AS limit_any
+  FROM %s
+  WHERE MetricName IN (%s, %s)
+    AND %s
+    AND (%s)
+    AND coalesce(Attributes['container'], '') = ''
+  GROUP BY node
+)
+WHERE node != '' AND (usage_bytes > 0 OR limit_bytes > 0)
+LIMIT 500`,
+		capacityNodeExpr(),
+		q(MetricContainerFSUsage), q(MetricContainerFSLimit),
+		q(MetricContainerFSUsage), q(MetricContainerFSLimit),
+		table(queries.CHTableMetricsGauge),
+		q(MetricContainerFSUsage), q(MetricContainerFSLimit),
+		MetricTimeFilter(from, to),
+		capacityEnvFilter(env),
 	)
 }
 
@@ -489,6 +569,7 @@ func ParseCapacityLedgerRows(rows []map[string]any) []CapacityContainerIdentity 
 			Pod:         ParseString(r["pod"]),
 			Container:   ctr,
 			Cluster:     ParseString(r["k8s_cluster_name"]),
+			Node:        ParseString(r["node"]),
 			UsageCPU:    ParseFloat(r["usage_cpu"]),
 			UsageMem:    ParseFloat(r["usage_mem"]),
 			ReqCPU:      ParseFloat(r["req_cpu"]),
@@ -523,7 +604,10 @@ func promMetric(labels map[string]string, v float64) queries.PromResult {
 }
 
 type capacityNsAgg struct {
+	nsName                   string
 	wasteCPU, wasteMem       float64
+	usageCPU, usageMem       float64
+	reqCPU, reqMem           float64
 	missReqCPU, missReqMem   int
 	missLimCPU, missLimMem   int
 	reservedCPU, reservedMem int
@@ -540,6 +624,9 @@ func emptyCapacityResultMap() map[string][]queries.PromResult {
 		"wasteCpuNs": {}, "wasteMemNs": {}, "wasteCpuTop": {}, "wasteMemTop": {},
 		"sumCpuUsage": {}, "sumMemUsage": {}, "sumCpuReq": {}, "sumMemReq": {},
 		"allocCpu": {}, "allocMem": {},
+		"nsCpuUsage": {}, "nsMemUsage": {}, "nsCpuReq": {}, "nsMemReq": {},
+		"nodeCpuUsage": {}, "nodeMemUsage": {}, "nodeCpuAlloc": {}, "nodeMemAlloc": {},
+		"nodeFsUsage": {}, "nodeFsLimit": {},
 		"gapMissingReqCpu": {}, "gapMissingReqMem": {},
 		"gapMissingLimCpu": {}, "gapMissingLimMem": {},
 		"gapReservedCpu": {}, "gapReservedMem": {},
@@ -558,11 +645,15 @@ func accumulateCapacityRow(
 	}
 	sumCPUUsage = r.UsageCPU
 	sumMemUsage = r.UsageMem
+	ns.usageCPU += r.UsageCPU
+	ns.usageMem += r.UsageMem
 	if r.HasReqCPU {
 		sumCPUReq = r.ReqCPU
+		ns.reqCPU += r.ReqCPU
 	}
 	if r.HasReqMem {
 		sumMemReq = r.ReqMem
+		ns.reqMem += r.ReqMem
 	}
 	hasUsage := r.HasUsageCPU || r.HasUsageMem || r.UsageCPU > 0 || r.UsageMem > 0
 	if r.HasReqCPU {
@@ -610,7 +701,8 @@ func accumulateCapacityRow(
 }
 
 func emitCapacityNamespaceGaps(rm map[string][]queries.PromResult, nsMap map[string]*capacityNsAgg) {
-	for nsName, a := range nsMap {
+	for _, a := range nsMap {
+		nsName := a.nsName
 		labels := map[string]string{"namespace": nsName, "k8s_cluster_name": a.cluster}
 		appendIfPos := func(key string, v float64) {
 			if v > 0 {
@@ -619,6 +711,10 @@ func emitCapacityNamespaceGaps(rm map[string][]queries.PromResult, nsMap map[str
 		}
 		appendIfPos("wasteCpuNs", a.wasteCPU)
 		appendIfPos("wasteMemNs", a.wasteMem)
+		appendIfPos("nsCpuUsage", a.usageCPU)
+		appendIfPos("nsMemUsage", a.usageMem)
+		appendIfPos("nsCpuReq", a.reqCPU)
+		appendIfPos("nsMemReq", a.reqMem)
 		appendIfPos("gapMissingReqCpu", float64(a.missReqCPU))
 		appendIfPos("gapMissingReqMem", float64(a.missReqMem))
 		appendIfPos("gapMissingLimCpu", float64(a.missLimCPU))
@@ -657,11 +753,18 @@ func CapacityLedgerToResultMap(rows []CapacityContainerIdentity, allocCPU, alloc
 	var sumCPUUsage, sumMemUsage, sumCPUReq, sumMemReq float64
 	var topCPU, topMem []capacityWasteRow
 
+	type nodeAgg struct{ cpu, mem float64 }
+	nodeUsage := map[string]*nodeAgg{}
+
 	for _, r := range rows {
-		ns := nsMap[r.Namespace]
+		key := r.Namespace
+		if r.Cluster != "" {
+			key = r.Cluster + "\x00" + r.Namespace
+		}
+		ns := nsMap[key]
 		if ns == nil {
-			ns = &capacityNsAgg{cluster: r.Cluster}
-			nsMap[r.Namespace] = ns
+			ns = &capacityNsAgg{nsName: r.Namespace, cluster: r.Cluster}
+			nsMap[key] = ns
 		}
 		if r.Cluster != "" {
 			ns.cluster = r.Cluster
@@ -671,10 +774,29 @@ func CapacityLedgerToResultMap(rows []CapacityContainerIdentity, allocCPU, alloc
 		sumMemUsage += uMem
 		sumCPUReq += rCPU
 		sumMemReq += rMem
+		if r.Node != "" {
+			na := nodeUsage[r.Node]
+			if na == nil {
+				na = &nodeAgg{}
+				nodeUsage[r.Node] = na
+			}
+			na.cpu += r.UsageCPU
+			na.mem += r.UsageMem
+		}
 	}
 
 	emitCapacityNamespaceGaps(rm, nsMap)
 	emitCapacityTopWaste(rm, topCPU, topMem)
+
+	for node, na := range nodeUsage {
+		labels := map[string]string{"node": node}
+		if na.cpu > 0 {
+			rm["nodeCpuUsage"] = append(rm["nodeCpuUsage"], promMetric(labels, na.cpu))
+		}
+		if na.mem > 0 {
+			rm["nodeMemUsage"] = append(rm["nodeMemUsage"], promMetric(labels, na.mem))
+		}
+	}
 
 	rm["sumCpuUsage"] = []queries.PromResult{promMetric(nil, sumCPUUsage)}
 	rm["sumMemUsage"] = []queries.PromResult{promMetric(nil, sumMemUsage)}
@@ -687,6 +809,46 @@ func CapacityLedgerToResultMap(rows []CapacityContainerIdentity, allocCPU, alloc
 		rm["allocMem"] = []queries.PromResult{promMetric(nil, allocMem)}
 	}
 	return rm
+}
+
+// MergeNodeAllocIntoResultMap adds per-node allocatable series from CapacityNodeAllocSQL rows.
+func MergeNodeAllocIntoResultMap(rm map[string][]queries.PromResult, rows []map[string]any) {
+	if rm == nil {
+		return
+	}
+	for _, r := range rows {
+		node := ParseString(r["node"])
+		if node == "" {
+			continue
+		}
+		labels := map[string]string{"node": node}
+		if cpu := ParseFloat(r["alloc_cpu"]); cpu > 0 {
+			rm["nodeCpuAlloc"] = append(rm["nodeCpuAlloc"], promMetric(labels, cpu))
+		}
+		if mem := ParseFloat(r["alloc_mem"]); mem > 0 {
+			rm["nodeMemAlloc"] = append(rm["nodeMemAlloc"], promMetric(labels, mem))
+		}
+	}
+}
+
+// MergeNodeFsIntoResultMap adds per-node filesystem usage/limit from CapacityNodeFsSQL rows.
+func MergeNodeFsIntoResultMap(rm map[string][]queries.PromResult, rows []map[string]any) {
+	if rm == nil {
+		return
+	}
+	for _, r := range rows {
+		node := ParseString(r["node"])
+		if node == "" {
+			continue
+		}
+		labels := map[string]string{"node": node}
+		if usage := ParseFloat(r["usage_bytes"]); usage > 0 {
+			rm["nodeFsUsage"] = append(rm["nodeFsUsage"], promMetric(labels, usage))
+		}
+		if limit := ParseFloat(r["limit_bytes"]); limit > 0 {
+			rm["nodeFsLimit"] = append(rm["nodeFsLimit"], promMetric(labels, limit))
+		}
+	}
 }
 
 // ParseCapacityAllocatable reads alloc_cpu / alloc_mem from CapacityAllocatableSQL.

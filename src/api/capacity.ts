@@ -41,11 +41,56 @@ export interface CapacityNamespaceRollup {
   environment?: string;
   wasteCpu: number;
   wasteMem: number;
+  cpuUsage?: number;
+  cpuRequest?: number;
+  memUsage?: number;
+  memRequest?: number;
+  cpuUsedRatio?: number;
+  memUsedRatio?: number;
   reclaimableMonthlyUsd: number;
   missingRequest: number;
   missingLimit: number;
   underProvisioned: number;
   throttled: number;
+}
+
+export interface CapacityEfficiencyBand {
+  under: number;
+  ok: number;
+  over: number;
+}
+
+export interface CapacityResourcePopulation {
+  cpu: CapacityEfficiencyBand;
+  mem: CapacityEfficiencyBand;
+  storage?: CapacityEfficiencyBand | null;
+}
+
+export interface CapacityPopulationScope {
+  total: number;
+  bands: CapacityResourcePopulation;
+}
+
+export interface CapacityPopulation {
+  clusters: CapacityPopulationScope;
+  nodes: CapacityPopulationScope;
+  namespaces: CapacityPopulationScope;
+}
+
+export interface CapacityNodeRollup {
+  node: string;
+  environment?: string;
+  cpuUsage: number;
+  cpuAlloc: number;
+  cpuUsedRatio?: number;
+  memUsage: number;
+  memAlloc: number;
+  memUsedRatio?: number;
+  storageUsage?: number;
+  storageLimit?: number;
+  storageRatio?: number;
+  podCount?: number;
+  conditionReady: boolean;
 }
 
 export interface CapacityContainerRow {
@@ -67,8 +112,10 @@ export interface CapacityOverview {
   available: boolean;
   enablementNote?: string;
   efficiency: CapacityEfficiency;
+  population?: CapacityPopulation;
   gapCounts: CapacityGapCounts;
   namespaces: CapacityNamespaceRollup[];
+  nodes?: CapacityNodeRollup[];
   topWasteCpu: CapacityContainerRow[];
   topWasteMem: CapacityContainerRow[];
   topRiskContainers: CapacityContainerRow[];

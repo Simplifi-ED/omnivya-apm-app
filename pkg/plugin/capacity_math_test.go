@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +9,98 @@ import (
 	"github.com/nais/grafana-otel-plugin/pkg/plugin/chquery"
 	"github.com/nais/grafana-otel-plugin/pkg/plugin/queries"
 )
+
+func TestClassifyUsedRatio(t *testing.T) {
+	t.Parallel()
+	if classifyUsedRatio(0.1, 1) != CapacityBandUnder {
+		t.Fatal("under")
+	}
+	if classifyUsedRatio(0.5, 1) != CapacityBandOK {
+		t.Fatal("ok")
+	}
+	if classifyUsedRatio(0.9, 1) != CapacityBandOver {
+		t.Fatal("over")
+	}
+	if classifyUsedRatio(1.2, 1) != CapacityBandOver {
+		t.Fatal("over request")
+	}
+	if classifyUsedRatio(1, 0) != "" {
+		t.Fatal("no capacity")
+	}
+}
+
+func TestBandFractionsFromCounts(t *testing.T) {
+	t.Parallel()
+	f := bandFractionsFromCounts(2, 2, 0)
+	if f.Under != 0.5 || f.OK != 0.5 || f.Over != 0 {
+		t.Fatalf("%+v", f)
+	}
+	if bandFractionsFromCounts(0, 0, 0).Under != 0 {
+		t.Fatal("empty")
+	}
+}
+
+func TestBuildCapacityPopulationAndNodes(t *testing.T) {
+	t.Parallel()
+	a := &App{}
+	fsUsage := 50.0
+	fsLimit := 100.0
+	rm := map[string][]queries.PromResult{
+		"sumCpuUsage": {{Value: queries.NewPromValue(0, "1")}},
+		"sumCpuReq":   {{Value: queries.NewPromValue(0, "4")}},
+		"sumMemUsage": {{Value: queries.NewPromValue(0, "1e8")}},
+		"sumMemReq":   {{Value: queries.NewPromValue(0, "4e8")}},
+		"nsCpuUsage": {
+			{Metric: map[string]string{"namespace": "alpha", "k8s_cluster_name": "prod"}, Value: queries.NewPromValue(0, "0.3")},
+		},
+		"nsCpuReq": {
+			{Metric: map[string]string{"namespace": "alpha", "k8s_cluster_name": "prod"}, Value: queries.NewPromValue(0, "1")},
+		},
+		"nsMemUsage": {
+			{Metric: map[string]string{"namespace": "alpha", "k8s_cluster_name": "prod"}, Value: queries.NewPromValue(0, "1e8")},
+		},
+		"nsMemReq": {
+			{Metric: map[string]string{"namespace": "alpha", "k8s_cluster_name": "prod"}, Value: queries.NewPromValue(0, "4e8")},
+		},
+		"nodeCpuUsage": {
+			{Metric: map[string]string{"node": "n1"}, Value: queries.NewPromValue(0, "1")},
+		},
+		"nodeCpuAlloc": {
+			{Metric: map[string]string{"node": "n1"}, Value: queries.NewPromValue(0, "4")},
+		},
+		"nodeMemUsage": {
+			{Metric: map[string]string{"node": "n1"}, Value: queries.NewPromValue(0, "1e8")},
+		},
+		"nodeMemAlloc": {
+			{Metric: map[string]string{"node": "n1"}, Value: queries.NewPromValue(0, "4e8")},
+		},
+		"nodeFsUsage": {
+			{Metric: map[string]string{"node": "n1"}, Value: queries.NewPromValue(0, fmt.Sprintf("%v", fsUsage))},
+		},
+		"nodeFsLimit": {
+			{Metric: map[string]string{"node": "n1"}, Value: queries.NewPromValue(0, fmt.Sprintf("%v", fsLimit))},
+		},
+	}
+	out := a.aggregateCapacity(rm)
+	if !out.Available {
+		t.Fatal("expected available")
+	}
+	if out.Population.Namespaces.Total != 1 || out.Population.Nodes.Total != 1 {
+		t.Fatalf("population totals: %+v", out.Population)
+	}
+	if out.Population.Namespaces.Bands.CPU.Under <= 0 {
+		t.Fatalf("ns cpu under band: %+v", out.Population.Namespaces.Bands.CPU)
+	}
+	if len(out.Nodes) != 1 || out.Nodes[0].StorageRatio == nil || *out.Nodes[0].StorageRatio != 0.5 {
+		t.Fatalf("nodes storage: %+v", out.Nodes)
+	}
+	if out.Population.Nodes.Bands.Storage == nil || out.Population.Nodes.Bands.Storage.OK <= 0 {
+		t.Fatalf("node storage band (50%% → ok): %+v", out.Population.Nodes.Bands.Storage)
+	}
+	if out.Population.Namespaces.Bands.Storage != nil {
+		t.Fatal("namespace storage must stay null without PVC series")
+	}
+}
 
 func TestCeilCPUCores(t *testing.T) {
 	t.Parallel()
