@@ -62,10 +62,25 @@ Path B needs **both** families in ClickHouse:
 
 Scrape kubelet/cAdvisor and kube-state-metrics into ClickHouse the same way existing KSM gauges already land.
 
+### Path B counter rates
+
+CPU usage and throttle are **counters**, so Path B reads their increase from
+adjacent samples with `lagInFrame` (partitioned by namespace, pod, container,
+cluster, and metric). A sample below its predecessor is a counter **reset**, and
+its own value is the increase. Extrema (`max - min`) is not used: a reset would
+report the whole counter, and one sample per bucket would report zero.
+
+Elapsed sample time is the divisor, so sparse buckets still yield a real rate,
+falling back to the bucket width when a bucket has no predecessor. Memory stays
+a gauge read via `argMax`.
+
 ### Path B recommendations
 
-Window percentiles approximate Path A `quantile_over_time(rate(...))` via 5m buckets in ClickHouse (`quantileExact` over per-bucket rates). Same Goldilocks burstable/guaranteed math and YAML patch as Path A.
+Window percentiles approximate Path A `quantile_over_time(rate(...))` via 5m buckets in ClickHouse (`quantileExact` over per-bucket reset-aware rates). Same Goldilocks burstable/guaranteed math and YAML patch as Path A.
 
 ### Path B history / forecast
 
-Bucketed range series with step clamp parity to Path A. Forecast uses an in-plugin **linear projection** over usage points (`methodLabel: "linear projection"`), including `daysToRequest` / `daysToLimit` when slope is positive. Ranges under 2h stay disabled with the existing note.
+Bucketed range series with step clamp parity to Path A. The scan starts one step
+before `from` so the first in-range sample has a preceding sample to rate
+against; that preceding row provides the baseline only and contributes no
+increase. Forecast uses an in-plugin **linear projection** over usage points (`methodLabel: "linear projection"`), including `daysToRequest` / `daysToLimit` when slope is positive. Ranges under 2h stay disabled with the existing note.

@@ -180,6 +180,62 @@ LIMIT 1`,
 	)
 }
 
+// capacityCapacityCounterPartition matches the Prom series identity of one
+// cAdvisor/KSM counter inside a Path B metric table.
+const capacityCounterPartition = "namespace, pod, container, k8s_cluster_name, MetricName"
+
+// capacityCounterLagSQL adds the previous sample of a counter series. Out of
+// frame lagInFrame yields 0 for both arguments, which would read as a real
+// previous sample, so the NaN default marks "no previous sample".
+func capacityCounterLagSQL() string {
+	win := fmt.Sprintf(
+		"OVER (PARTITION BY %s ORDER BY TimeUnix ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)",
+		capacityCounterPartition,
+	)
+	return fmt.Sprintf(
+		"lagInFrame(Value, 1, nan) %s AS prev_val,\n    lagInFrame(TimeUnix) %s AS prev_ts",
+		win, win,
+	)
+}
+
+// capacityCounterIncSQL is the reset-aware increase. Mirrors
+// capacityResetAwareIncrease: a decrease is a counter reset, so the new value
+// is the increase.
+func capacityCounterIncSQL() string {
+	return "if(isNaN(prev_val), 0., if(Value >= prev_val, Value - prev_val, Value)) AS inc"
+}
+
+// capacityCounterDtSQL is the elapsed seconds since the previous sample, which
+// stays 0 when the series has no preceding sample.
+func capacityCounterDtSQL() string {
+	return "if(isNaN(prev_val), 0, dateDiff('second', prev_ts, TimeUnix)) AS dt"
+}
+
+// capacityResetAwareIncrease is the Go twin of capacityCounterIncSQL, kept so
+// the reset rule is testable without a ClickHouse round trip.
+func capacityResetAwareIncrease(prev, cur float64, hasPrev bool) float64 {
+	if !hasPrev {
+		return 0
+	}
+	if cur >= prev {
+		return cur - prev
+	}
+	return cur
+}
+
+// capacityCounterRateSQL is a reset-aware counter rate. It divides by the
+// elapsed sample seconds actually covered, so a sparse bucket still yields a
+// real rate, and falls back to the bucket width when no sample had a
+// predecessor. Both sums scope to one metric so the gauge rows sharing the
+// group cannot dilute the elapsed divisor.
+func capacityCounterRateSQL(metric string, fallbackSec int) string {
+	sumDt := fmt.Sprintf("sumIf(dt, MetricName = %s)", metric)
+	return fmt.Sprintf(
+		"greatest(sumIf(inc, MetricName = %s), 0) / if(%s > 0, %s, %d)",
+		metric, sumDt, sumDt, fallbackSec,
+	)
+}
+
 // CapacityLedgerSQL returns one row per (namespace, pod, container) with usage,
 // request, limit, and throttle columns over the lookback window ending at `to`.
 // from should be to - CapacityUsageLookbackSec for rate deltas.
@@ -205,19 +261,13 @@ SELECT
   container,
   k8s_cluster_name,
   node,
-  greatest(
-    maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s),
-    0
-  ) / %g AS usage_cpu,
+  greatest(sumIf(inc, MetricName = %s), 0) / %g AS usage_cpu,
   argMaxIf(Value, TimeUnix, MetricName = %s) AS usage_mem,
   argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS req_cpu,
   argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'memory') AS req_mem,
   argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS lim_cpu,
   argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'memory') AS lim_mem,
-  greatest(
-    maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s),
-    0
-  ) / %g AS thr_rate,
+  greatest(sumIf(inc, MetricName = %s), 0) / %g AS thr_rate,
   countIf(MetricName = %s) > 0 AS has_usage_cpu,
   countIf(MetricName = %s) > 0 AS has_usage_mem,
   countIf(MetricName = %s AND Attributes['resource'] = 'cpu') > 0 AS has_req_cpu,
@@ -227,42 +277,56 @@ SELECT
   countIf(MetricName = %s) > 0 AS has_throttle
 FROM (
   SELECT
-    %s AS namespace,
-    %s AS pod,
-    %s AS container,
-    %s AS k8s_cluster_name,
-    %s AS node,
+    namespace,
+    pod,
+    container,
+    k8s_cluster_name,
+    node,
     MetricName,
     TimeUnix,
     Value,
-    Attributes
-  FROM %s
-  WHERE MetricName IN (%s, %s)
-    AND %s AND (%s) AND (%s) AND (%s)
-  UNION ALL
-  SELECT
-    %s AS namespace,
-    %s AS pod,
-    %s AS container,
-    %s AS k8s_cluster_name,
-    %s AS node,
-    MetricName,
-    TimeUnix,
-    Value,
-    Attributes
-  FROM %s
-  WHERE MetricName IN (%s, %s, %s)
-    AND %s AND (%s) AND (%s) AND (%s)
+    Attributes,
+    %s,
+    %s
+  FROM (
+    SELECT
+      %s AS namespace,
+      %s AS pod,
+      %s AS container,
+      %s AS k8s_cluster_name,
+      %s AS node,
+      MetricName,
+      TimeUnix,
+      Value,
+      Attributes
+    FROM %s
+    WHERE MetricName IN (%s, %s)
+      AND %s AND (%s) AND (%s) AND (%s)
+    UNION ALL
+    SELECT
+      %s AS namespace,
+      %s AS pod,
+      %s AS container,
+      %s AS k8s_cluster_name,
+      %s AS node,
+      MetricName,
+      TimeUnix,
+      Value,
+      Attributes
+    FROM %s
+    WHERE MetricName IN (%s, %s, %s)
+      AND %s AND (%s) AND (%s) AND (%s)
+  )
 )
 GROUP BY namespace, pod, container, k8s_cluster_name, node
 HAVING container != '' AND container != 'POD'`,
-		q(MetricContainerCPUUsage), q(MetricContainerCPUUsage), win,
+		q(MetricContainerCPUUsage), win,
 		q(MetricContainerMemoryWorkingSet),
 		q(MetricKubePodResourceRequests),
 		q(MetricKubePodResourceRequests),
 		q(MetricKubePodResourceLimits),
 		q(MetricKubePodResourceLimits),
-		q(MetricContainerCPUThrottled), q(MetricContainerCPUThrottled), win,
+		q(MetricContainerCPUThrottled), win,
 		q(MetricContainerCPUUsage),
 		q(MetricContainerMemoryWorkingSet),
 		q(MetricKubePodResourceRequests),
@@ -270,6 +334,8 @@ HAVING container != '' AND container != 'POD'`,
 		q(MetricKubePodResourceLimits),
 		q(MetricKubePodResourceLimits),
 		q(MetricContainerCPUThrottled),
+		capacityCounterLagSQL(),
+		capacityCounterIncSQL(),
 		nsE, podE, ctrE, clE, nodeE,
 		table(queries.CHTableMetricsSum),
 		q(MetricContainerCPUUsage), q(MetricContainerCPUThrottled),
@@ -438,56 +504,74 @@ FROM (
     container,
     k8s_cluster_name,
     bucket,
-    greatest(maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s), 0) / %d AS cpu_rate,
+    %s AS cpu_rate,
     argMaxIf(Value, TimeUnix, MetricName = %s) AS mem_val,
     maxIf(Value, MetricName = %s) AS mem_max,
-    greatest(maxIf(Value, MetricName = %s) - minIf(Value, MetricName = %s), 0) / %d AS thr_rate,
+    %s AS thr_rate,
     argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS req_cpu,
     argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'memory') AS req_mem,
     argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS lim_cpu,
     argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'memory') AS lim_mem
   FROM (
     SELECT
-      %s AS namespace,
-      %s AS pod,
-      %s AS container,
-      %s AS k8s_cluster_name,
-      toStartOfInterval(TimeUnix, INTERVAL %d SECOND) AS bucket,
+      namespace,
+      pod,
+      container,
+      k8s_cluster_name,
+      bucket,
       MetricName,
       TimeUnix,
       Value,
-      Attributes
-    FROM %s
-    WHERE MetricName IN (%s, %s)
-      AND %s AND (%s) AND (%s) AND (%s)
-    UNION ALL
-    SELECT
-      %s AS namespace,
-      %s AS pod,
-      %s AS container,
-      %s AS k8s_cluster_name,
-      toStartOfInterval(TimeUnix, INTERVAL %d SECOND) AS bucket,
-      MetricName,
-      TimeUnix,
-      Value,
-      Attributes
-    FROM %s
-    WHERE MetricName IN (%s, %s, %s)
-      AND %s AND (%s) AND (%s) AND (%s)
+      Attributes,
+      %s,
+      %s,
+      %s
+    FROM (
+      SELECT
+        %s AS namespace,
+        %s AS pod,
+        %s AS container,
+        %s AS k8s_cluster_name,
+        toStartOfInterval(TimeUnix, INTERVAL %d SECOND) AS bucket,
+        MetricName,
+        TimeUnix,
+        Value,
+        Attributes
+      FROM %s
+      WHERE MetricName IN (%s, %s)
+        AND %s AND (%s) AND (%s) AND (%s)
+      UNION ALL
+      SELECT
+        %s AS namespace,
+        %s AS pod,
+        %s AS container,
+        %s AS k8s_cluster_name,
+        toStartOfInterval(TimeUnix, INTERVAL %d SECOND) AS bucket,
+        MetricName,
+        TimeUnix,
+        Value,
+        Attributes
+      FROM %s
+      WHERE MetricName IN (%s, %s, %s)
+        AND %s AND (%s) AND (%s) AND (%s)
+    )
   )
   GROUP BY namespace, pod, container, k8s_cluster_name, bucket
   HAVING container != '' AND container != 'POD'
 )
 GROUP BY namespace, pod, container, k8s_cluster_name
 LIMIT 5000`,
-		q(MetricContainerCPUUsage), q(MetricContainerCPUUsage), bucket,
+		capacityCounterRateSQL(q(MetricContainerCPUUsage), bucket),
 		q(MetricContainerMemoryWorkingSet),
 		q(MetricContainerMemoryWorkingSet),
-		q(MetricContainerCPUThrottled), q(MetricContainerCPUThrottled), bucket,
+		capacityCounterRateSQL(q(MetricContainerCPUThrottled), bucket),
 		q(MetricKubePodResourceRequests),
 		q(MetricKubePodResourceRequests),
 		q(MetricKubePodResourceLimits),
 		q(MetricKubePodResourceLimits),
+		capacityCounterLagSQL(),
+		capacityCounterIncSQL(),
+		capacityCounterDtSQL(),
 		nsE, podE, ctrE, clE, bucket,
 		table(queries.CHTableMetricsSum),
 		q(MetricContainerCPUUsage), q(MetricContainerCPUThrottled),
@@ -502,12 +586,15 @@ LIMIT 5000`,
 // CapacityHistorySeriesSQL returns bucketed fleet aggregates for one namespace.
 // Optional workload scopes pods (prefix/exact match). Cluster is kept in the
 // inner GROUP BY so multi-cluster series stay independent until the outer sum.
+// The scan starts one step before `from` so each first in-range sample has the
+// preceding sample needed to rate a counter. That preceding row is lag input
+// only and contributes no increase of its own.
 func CapacityHistorySeriesSQL(namespace, container, env, workload string, from, to time.Time, stepSec int) string {
 	if stepSec < 15 {
 		stepSec = 15
 	}
 	wl := workload
-	tf := MetricTimeFilter(from, to)
+	tf := MetricTimeFilter(from.Add(-time.Duration(stepSec)*time.Second), to)
 	nsF := capacityNamespaceFilter(namespace)
 	envF := capacityEnvFilter(env)
 	wlF := capacityPodWorkloadFilter(wl)
@@ -520,59 +607,98 @@ func CapacityHistorySeriesSQL(namespace, container, env, workload string, from, 
 	podE := capacityPodExpr()
 	ctrE := capacityContainerExpr()
 	clE := capacityClusterExpr()
+	inRange := fmt.Sprintf("%s >= fromUnixTimestamp64Milli(%d)", ColTimeUnix, from.UnixMilli())
 
 	return fmt.Sprintf(`
 SELECT
   bucket_ms,
-  greatest(sumIf(delta, MetricName = %s), 0) / %d AS cpu_usage,
+  %s AS cpu_usage,
   sumIf(latest, MetricName = %s AND resource = 'cpu') AS cpu_request,
   sumIf(latest, MetricName = %s AND resource = 'cpu') AS cpu_limit,
   sumIf(latest, MetricName = %s) AS mem_usage,
   sumIf(latest, MetricName = %s AND resource = 'memory') AS mem_request,
   sumIf(latest, MetricName = %s AND resource = 'memory') AS mem_limit,
-  greatest(sumIf(delta, MetricName = %s), 0) / %d AS cpu_throttled,
-  greatest(sumIf(delta, MetricName = %s), 0) AS restarts
+  %s AS cpu_throttled,
+  greatest(sumIf(inc, MetricName = %s), 0) AS restarts
 FROM (
   SELECT
-    toUnixTimestamp(toStartOfInterval(TimeUnix, INTERVAL %d SECOND)) * 1000 AS bucket_ms,
+    bucket_ms,
     MetricName,
-    coalesce(nullIf(Attributes['resource'], ''), '') AS resource,
-    %s AS namespace,
-    %s AS pod,
-    %s AS container,
-    %s AS k8s_cluster_name,
-    greatest(max(Value) - min(Value), 0) AS delta,
+    resource,
+    namespace,
+    pod,
+    container,
+    k8s_cluster_name,
+    sum(inc) AS inc,
+    sum(dt) AS dt,
     argMax(Value, TimeUnix) AS latest
   FROM (
-    SELECT TimeUnix, MetricName, Value, Attributes, ResourceAttributes
-    FROM %s
-    WHERE MetricName IN (%s, %s, %s)
-      AND %s AND (%s) AND (%s) AND (%s) AND (%s) AND (%s)
-    UNION ALL
-    SELECT TimeUnix, MetricName, Value, Attributes, ResourceAttributes
-    FROM %s
-    WHERE MetricName IN (%s, %s, %s)
-      AND %s AND (%s) AND (%s) AND (%s) AND (%s) AND (%s)
+    SELECT
+      toUnixTimestamp(toStartOfInterval(TimeUnix, INTERVAL %d SECOND)) * 1000 AS bucket_ms,
+      coalesce(nullIf(Attributes['resource'], ''), '') AS resource,
+      namespace,
+      pod,
+      container,
+      k8s_cluster_name,
+      MetricName,
+      TimeUnix,
+      Value,
+      %s,
+      %s,
+      %s,
+      if(%s, 1, 0) AS in_range
+    FROM (
+      SELECT
+        %s AS namespace,
+        %s AS pod,
+        %s AS container,
+        %s AS k8s_cluster_name,
+        TimeUnix,
+        MetricName,
+        Value,
+        Attributes
+      FROM %s
+      WHERE MetricName IN (%s, %s, %s)
+        AND %s AND (%s) AND (%s) AND (%s) AND (%s) AND (%s)
+      UNION ALL
+      SELECT
+        %s AS namespace,
+        %s AS pod,
+        %s AS container,
+        %s AS k8s_cluster_name,
+        TimeUnix,
+        MetricName,
+        Value,
+        Attributes
+      FROM %s
+      WHERE MetricName IN (%s, %s, %s)
+        AND %s AND (%s) AND (%s) AND (%s) AND (%s) AND (%s)
+    )
   )
   GROUP BY bucket_ms, MetricName, resource, namespace, pod, container, k8s_cluster_name
-  HAVING container != '' AND container != 'POD'
+  HAVING container != '' AND container != 'POD' AND sum(in_range) > 0
 )
 GROUP BY bucket_ms
 ORDER BY bucket_ms
 LIMIT 5000`,
-		q(MetricContainerCPUUsage), stepSec,
+		capacityCounterRateSQL(q(MetricContainerCPUUsage), stepSec),
 		q(MetricKubePodResourceRequests),
 		q(MetricKubePodResourceLimits),
 		q(MetricContainerMemoryWorkingSet),
 		q(MetricKubePodResourceRequests),
 		q(MetricKubePodResourceLimits),
-		q(MetricContainerCPUThrottled), stepSec,
+		capacityCounterRateSQL(q(MetricContainerCPUThrottled), stepSec),
 		q(MetricKubePodRestarts),
 		stepSec,
+		capacityCounterLagSQL(),
+		capacityCounterIncSQL(),
+		capacityCounterDtSQL(),
+		inRange,
 		nsE, podE, ctrE, clE,
 		table(queries.CHTableMetricsSum),
 		q(MetricContainerCPUUsage), q(MetricContainerCPUThrottled), q(MetricKubePodRestarts),
 		tf, nsF, envF, ctrF, ctrX, wlF,
+		nsE, podE, ctrE, clE,
 		table(queries.CHTableMetricsGauge),
 		q(MetricContainerMemoryWorkingSet), q(MetricKubePodResourceRequests), q(MetricKubePodResourceLimits),
 		tf, nsF, envF, ctrF, ctrX, wlF,
