@@ -180,7 +180,7 @@ LIMIT 1`,
 	)
 }
 
-// capacityCapacityCounterPartition matches the Prom series identity of one
+// capacityCounterPartition matches the Prom series identity of one
 // cAdvisor/KSM counter inside a Path B metric table.
 const capacityCounterPartition = "namespace, pod, container, k8s_cluster_name, MetricName"
 
