@@ -5,6 +5,7 @@ export const PLUGIN_BASE_URL = `/a/${pluginJson.id}`;
 export enum ROUTES {
   Services = 'services',
   Jobs = 'jobs',
+  Capacity = 'capacity',
   ServiceMap = 'service-map',
   Favorites = 'favorites',
   OpsStatus = 'ops',

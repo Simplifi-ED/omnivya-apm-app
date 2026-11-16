@@ -71,4 +71,9 @@ export interface AppPluginSettings {
    * Unknown teams still display with teamKnown=false.
    */
   knownTeams?: string[];
+  /**
+   * Optional hourly on-demand unit rates for Capacity USD estimates.
+   * Defaults: cpuHourUsd 0.0316, memoryGibHourUsd 0.0042.
+   */
+  capacityCostRates?: { cpuHourUsd?: number; memoryGibHourUsd?: number };
 }

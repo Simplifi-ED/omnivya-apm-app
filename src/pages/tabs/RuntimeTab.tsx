@@ -14,6 +14,7 @@ import {
   MemoryPool,
 } from '../../api/client';
 import { useFetch } from '../../utils/useFetch';
+import { useAppNavigate } from '../../utils/navigation';
 import { typographyFontSize } from '../../utils/themeTypography';
 import { CardGridSkeleton } from '../../components/Skeleton';
 
@@ -57,7 +58,7 @@ export function RuntimeTab({ service, namespace, environment, fromMs, toMs }: Ru
 
   return (
     <div className={styles.container}>
-      {data?.container && <ContainerCard container={data.container} />}
+      {data?.container && <ContainerCard container={data.container} namespace={namespace} environment={environment} />}
       {data?.jvm && <JVMCard jvm={data.jvm} />}
       {data?.nodejs && <NodeJSCard nodejs={data.nodejs} />}
       {data?.go && <GoCard goRt={data.go} />}
@@ -429,8 +430,17 @@ function KafkaCard({ kafka }: { kafka: KafkaRuntime }) {
 // Container Resources Card
 // ---------------------------------------------------------------------------
 
-function ContainerCard({ container }: { container: ContainerRuntime }) {
+function ContainerCard({
+  container,
+  namespace,
+  environment,
+}: {
+  container: ContainerRuntime;
+  namespace: string;
+  environment?: string;
+}) {
   const styles = useStyles2(getStyles);
+  const appNavigate = useAppNavigate();
 
   const cpuPctReq = container.cpuRequests > 0 ? (container.cpuUsage / container.cpuRequests) * 100 : 0;
   const cpuPctLim = container.cpuLimits > 0 ? (container.cpuUsage / container.cpuLimits) * 100 : 0;
@@ -452,6 +462,23 @@ function ContainerCard({ container }: { container: ContainerRuntime }) {
             color="red"
           />
         )}
+        <button
+          type="button"
+          className={styles.capacityLink}
+          onClick={() => {
+            const params: Record<string, string> = {
+              namespace,
+              histNs: namespace,
+              capTab: 'rightsizing',
+            };
+            if (environment) {
+              params.environment = environment;
+            }
+            appNavigate('capacity', params);
+          }}
+        >
+          Capacity →
+        </button>
       </div>
 
       <div className={styles.metricsGrid}>
@@ -835,6 +862,18 @@ const getStyles = (theme: GrafanaTheme2) => ({
     font-weight: ${theme.typography.fontWeightMedium};
     margin-bottom: ${theme.spacing(2)};
     color: ${theme.colors.text.primary};
+  `,
+  capacityLink: css`
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: ${theme.colors.text.link};
+    cursor: pointer;
+    font-size: ${typographyFontSize(theme, 'sm')};
+    padding: 0;
+    &:hover {
+      text-decoration: underline;
+    }
   `,
   metricsGrid: css`
     display: grid;

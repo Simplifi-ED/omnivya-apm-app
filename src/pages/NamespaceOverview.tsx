@@ -37,6 +37,7 @@ import { NamespaceServicesTable } from './namespace/NamespaceServicesTable';
 import { NamespaceDependencies } from './namespace/NamespaceDependencies';
 import { NamespaceAlerts } from './namespace/NamespaceAlerts';
 import { NamespaceScorecardRollup } from './namespace/NamespaceScorecardRollup';
+import { NamespaceCapacityBlock } from './namespace/NamespaceCapacityBlock';
 import { getNamespaceScorecard, NamespaceScorecardResponse } from '../api/scorecard';
 import { getNamespaceOwnership, NamespaceOwnershipResponse } from '../api/ownership';
 
@@ -351,6 +352,13 @@ function NamespaceOverview() {
               const env = environment || (envFilters.length === 1 ? envFilters[0] : undefined);
               handleServiceClick(decodedNs, svc, env);
             }}
+          />
+
+          <NamespaceCapacityBlock
+            namespace={decodedNs}
+            environment={envFilters.length === 1 ? envFilters[0] : envFilters.join(',') || undefined}
+            fromMs={fromMs}
+            toMs={toMs}
           />
 
           {!nsOwnershipLoading && nsOwnership && nsOwnership.total > 0 && (

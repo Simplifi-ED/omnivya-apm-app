@@ -48,6 +48,9 @@ type App struct {
 	scorecardOnce  sync.Once      // lazily builds the dedicated long-TTL scorecard cache
 	scorecardCache *responseCache // see scorecardResponseCache()
 
+	capacityOnce  sync.Once      // lazily builds the dedicated Capacity response cache
+	capacityCache *responseCache // see capacityResponseCache()
+
 	// ingressByService maps service_name → list of ingress hostnames that route to it.
 	// Built from settings.IngressAliases (reversed). Used to expand caller queries.
 	ingressByService map[string][]string
@@ -450,6 +453,10 @@ func (a *App) routes() []appRoute {
 		{"/services/{namespace}/{service}/ownership", a.handleOwnership},
 		{"/services/{namespace}/{service}/alerts", a.handleServiceAlerts},
 		{"/jobs", a.handleJobs},
+		{"/capacity", a.handleCapacity},
+		{"/capacity/recommendations", a.handleCapacityRecommendations},
+		{"/capacity/history", a.handleCapacityHistory},
+		{"/capacity/forecast", a.handleCapacityForecast},
 		{"/service-map", a.handleServiceMap},
 		{"/service-map/clustered", a.handleClusteredServiceMap},
 		{"/dependencies", a.handleGlobalDependencies},
@@ -459,6 +466,7 @@ func (a *App) routes() []appRoute {
 		{"/namespaces/{namespace}/issues-attention", a.handleNamespaceIssuesAttention},
 		{"/namespaces/{namespace}/scorecard", a.handleNamespaceScorecard},
 		{"/namespaces/{namespace}/ownership", a.handleNamespaceOwnership},
+		{"/namespaces/{namespace}/capacity", a.handleNamespaceCapacity},
 		{"/ownership/coverage", a.handleFleetOwnership},
 		{"/alert-templates/{kind}", a.handleAlertTemplate},
 		{"/ops-watchlist", a.handleOpsWatchlist},
