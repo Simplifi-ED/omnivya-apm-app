@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nais/grafana-otel-plugin/pkg/plugin/chquery"
 	"github.com/nais/grafana-otel-plugin/pkg/plugin/queries"
 )
 
@@ -167,5 +168,72 @@ func TestAggregateCapacityWithWaste(t *testing.T) {
 	}
 	if out.Efficiency.RatesAreEstimates != true {
 		t.Fatal("rates must be labeled estimates")
+	}
+}
+
+func TestCapacityClickHouseLedgerMapsIntoAggregate(t *testing.T) {
+	t.Parallel()
+	a := &App{}
+	rows := []chquery.CapacityContainerIdentity{
+		{
+			Namespace: "demo", Pod: "api-0", Container: "api", Cluster: "prod",
+			UsageCPU: 0.25, UsageMem: 1e8, ReqCPU: 1, ReqMem: 5e8,
+			LimCPU: 2, LimMem: 1e9, Throttled: 0.02,
+			HasUsageCPU: true, HasUsageMem: true,
+			HasReqCPU: true, HasReqMem: true,
+			HasLimCPU: true, HasLimMem: true, HasThrottle: true,
+		},
+		{
+			Namespace: "demo", Pod: "api-1", Container: "api", Cluster: "prod",
+			UsageCPU: 1.2, UsageMem: 6e8, ReqCPU: 1, ReqMem: 5e8,
+			HasUsageCPU: true, HasUsageMem: true,
+			HasReqCPU: true, HasReqMem: true,
+		},
+	}
+	rm := chquery.CapacityLedgerToResultMap(rows, 32, 128e9)
+	out := a.aggregateCapacity(rm)
+	if !out.Available {
+		t.Fatal("Available=false")
+	}
+	if out.GapCounts.OverRequestedCPU < 1 {
+		t.Fatalf("over-requested: %+v", out.GapCounts)
+	}
+	if out.GapCounts.UnderProvisioned < 1 {
+		t.Fatalf("under-provisioned: %+v", out.GapCounts)
+	}
+	if out.GapCounts.Throttled < 1 {
+		t.Fatalf("throttled: %+v", out.GapCounts)
+	}
+	if out.Efficiency.CPUAllocRatio == nil || *out.Efficiency.CPUAllocRatio <= 0 {
+		t.Fatalf("alloc ratio: %+v", out.Efficiency)
+	}
+	if len(out.TopWasteCPU) < 1 || len(out.Namespaces) < 1 {
+		t.Fatalf("top/ns empty: waste=%d ns=%d", len(out.TopWasteCPU), len(out.Namespaces))
+	}
+}
+
+func TestAggregateRecommendationsFromCHResultMap(t *testing.T) {
+	t.Parallel()
+	a := &App{}
+	rm := capacityRecsCHToResultMap(
+		[]chquery.CapacityRecRow{{
+			Namespace: "demo", Pod: "web-abc", Container: "web", Cluster: "prod",
+			CPUP50: 0.1, CPUP95: 0.2, CPUMax: 0.4,
+			MemP95: 1e8, MemMax: 2e8, ReqCPU: 1, ReqMem: 5e8, LimCPU: 2, LimMem: 1e9,
+		}},
+		[]chquery.CapacityOwner{{
+			Namespace: "demo", Pod: "web-abc", Kind: "ReplicaSet", Name: "web-7d9f8c6b5", Cluster: "prod",
+		}},
+	)
+	out := a.aggregateRecommendations(rm, "prod", 24*time.Hour)
+	if !out.Available || len(out.Recommendations) != 1 {
+		t.Fatalf("%+v", out)
+	}
+	rec := out.Recommendations[0]
+	if rec.WorkloadKind != "Deployment" || rec.WorkloadName != "web" {
+		t.Fatalf("owner mapping: kind=%s name=%s", rec.WorkloadKind, rec.WorkloadName)
+	}
+	if rec.YAMLPatch == "" || rec.Burstable.CPUReq <= 0 {
+		t.Fatalf("goldilocks empty: %+v", rec)
 	}
 }

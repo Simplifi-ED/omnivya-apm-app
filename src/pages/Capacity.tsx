@@ -226,7 +226,7 @@ function Capacity() {
               emptyTitle="Capacity metrics unavailable"
               emptyMessage={
                 overview?.enablementNote ||
-                'Deploy kube-state-metrics and cAdvisor scrapes to a Prometheus metricsDataSource.'
+                'Deploy kube-state-metrics and cAdvisor scrapes to Prometheus (Path A) or ClickHouse otel_metrics_* (Path B).'
               }
               skeleton={<TableSkeleton rows={8} />}
             >

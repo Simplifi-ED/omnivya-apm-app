@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/grafana/grafana-plugin-sdk-go/backend/log"
+	"github.com/nais/grafana-otel-plugin/pkg/plugin/chquery"
 	"github.com/nais/grafana-otel-plugin/pkg/plugin/otelconfig"
 	"github.com/nais/grafana-otel-plugin/pkg/plugin/queries"
 )
@@ -21,8 +22,14 @@ const (
 	capacityLookback       = "5m"
 	capacityEnablementNote = "Capacity efficiency needs cAdvisor and kube-state-metrics " +
 		"(container_* and kube_pod_container_resource_*) on a Prometheus metricsDataSource (Path A) " +
-		"or the same series in ClickHouse. Deploy kube-state-metrics and a metrics agent that scrapes the kubelet. " +
+		"or the same Prom-style series in ClickHouse otel_metrics_* (Path B). " +
+		"Scrape kube-state-metrics and kubelet/cAdvisor into the configured metrics backend. " +
 		"No cluster agents (for example Goldilocks or VPA) are required."
+	capacityCHMissingUsageNote = "ClickHouse has kube-state-metrics gauges but no cAdvisor usage series " +
+		"(container_cpu_usage_seconds_total or container_memory_working_set_bytes). " +
+		"Scrape kubelet/cAdvisor with Prom-style MetricNames into otel_metrics_*. process_* is not a valid usage substitute."
+	capacityCHMissingKSMNote = "ClickHouse has usage series but no kube_pod_container_resource_requests. " +
+		"Scrape kube-state-metrics into otel_metrics_gauge."
 )
 
 // ---------------------------------------------------------------------------
@@ -262,7 +269,7 @@ func (a *App) handleCapacityRecommendations(w http.ResponseWriter, req *http.Req
 		return
 	}
 	data, err := cache.getOrCompute(ck, func() (any, error) {
-		return a.resolveRecommendations(ctx, namespace, env, from, to), nil
+		return a.resolveRecommendations(ctx, req, namespace, env, from, to), nil
 	})
 	if err != nil {
 		http.Error(w, "querying capacity recommendations failed: "+err.Error(), http.StatusInternalServerError)
@@ -289,7 +296,7 @@ func (a *App) handleCapacityHistory(w http.ResponseWriter, req *http.Request) {
 	orgID := req.Header.Get("X-Grafana-Org-Id")
 	ck := cacheKey("capacity-hist", orgID, roundedUnix(from), roundedUnix(to), namespace, workload, container, env)
 	a.writeCached(w, ck, "querying capacity history failed", func() (any, error) {
-		return a.resolveHistory(ctx, namespace, workload, container, env, from, to), nil
+		return a.resolveHistory(ctx, req, namespace, workload, container, env, from, to), nil
 	})
 }
 
@@ -325,7 +332,7 @@ func (a *App) handleCapacityForecast(w http.ResponseWriter, req *http.Request) {
 	orgID := req.Header.Get("X-Grafana-Org-Id")
 	ck := cacheKey("capacity-fc", orgID, roundedUnix(from), roundedUnix(to), resource, namespace, workload, container, env)
 	a.writeCached(w, ck, "querying capacity forecast failed", func() (any, error) {
-		return a.resolveForecast(ctx, resource, namespace, workload, container, env, from, to), nil
+		return a.resolveForecast(ctx, req, resource, namespace, workload, container, env, from, to), nil
 	})
 }
 
@@ -544,14 +551,7 @@ func (a *App) aggregateCapacity(resultMap map[string][]queries.PromResult) Capac
 	}
 }
 
-func (a *App) queryCapacityClickHouse(ctx context.Context, ch *queries.ClickHouseClient, namespace, env string, at time.Time) CapacityOverview {
-	_ = ctx
-	_ = ch
-	_ = namespace
-	_ = env
-	_ = at
-	// Path B: full CH aggregation lands with richer otel_metrics joins.
-	// Soft-unavailable keeps Jobs-style dual-path contract without fake zeros.
+func (a *App) capacityEmptyOverview(note string) CapacityOverview {
 	rates := queriesCapacityRates{
 		CPUHourUSD:    a.settings.CapacityCostRates.CPUHourUSD,
 		MemoryGiBHour: a.settings.CapacityCostRates.MemoryGiBHour,
@@ -559,13 +559,61 @@ func (a *App) queryCapacityClickHouse(ctx context.Context, ch *queries.ClickHous
 	cpuHour, memHour := capacityCostRates(rates)
 	return CapacityOverview{
 		Available:         false,
-		EnablementNote:    capacityEnablementNote + " ClickHouse Path B for Capacity overview is not yet emitting series for this install; configure a Prometheus metricsDataSource for Path A.",
+		EnablementNote:    note,
 		Namespaces:        []CapacityNamespaceRollup{},
 		TopWasteCPU:       []CapacityContainerRow{},
 		TopWasteMem:       []CapacityContainerRow{},
 		TopRiskContainers: []CapacityContainerRow{},
 		Efficiency:        CapacityEfficiency{CPUHourUSD: cpuHour, MemoryGiBHourUSD: memHour, RatesAreEstimates: true},
 	}
+}
+
+// queryCapacityClickHouse implements Path B: probe usage+KSM → ledger → aggregateCapacity.
+func (a *App) queryCapacityClickHouse(ctx context.Context, ch *queries.ClickHouseClient, namespace, env string, at time.Time) CapacityOverview {
+	logger := log.DefaultLogger.With("handler", "capacity-clickhouse")
+	if ch == nil {
+		return a.capacityEmptyOverview(capacityEnablementNote)
+	}
+
+	from := at.Add(-time.Duration(chquery.CapacityUsageLookbackSec) * time.Second)
+	opts := queries.ClickHouseQueryOptions{From: from, To: at, Limit: 10000, SkipLimitEnforcement: true}
+
+	usageRes, err := ch.Query(ctx, chquery.CapacityUsageProbeSQL(from, at), opts)
+	if err != nil {
+		logger.Warn("capacity CH usage probe failed", "error", err)
+		return a.capacityEmptyOverview(capacityEnablementNote)
+	}
+	ksmRes, err := ch.Query(ctx, chquery.CapacityKSMProbeSQL(from, at), opts)
+	if err != nil {
+		logger.Warn("capacity CH KSM probe failed", "error", err)
+		return a.capacityEmptyOverview(capacityEnablementNote)
+	}
+	hasUsage := chquery.ParseCapacityProbeCount(usageRes.Maps()) > 0
+	hasKSM := chquery.ParseCapacityProbeCount(ksmRes.Maps()) > 0
+	switch {
+	case !hasUsage && !hasKSM:
+		return a.capacityEmptyOverview(capacityEnablementNote)
+	case !hasUsage:
+		return a.capacityEmptyOverview(capacityCHMissingUsageNote)
+	case !hasKSM:
+		return a.capacityEmptyOverview(capacityCHMissingKSMNote)
+	}
+
+	ledgerRes, err := ch.Query(ctx, chquery.CapacityLedgerSQL(namespace, env, from, at), opts)
+	if err != nil {
+		logger.Warn("capacity CH ledger failed", "error", err)
+		return a.capacityEmptyOverview(capacityEnablementNote)
+	}
+	rows := chquery.ParseCapacityLedgerRows(ledgerRes.Maps())
+
+	var allocCPU, allocMem float64
+	if allocRes, aerr := ch.Query(ctx, chquery.CapacityAllocatableSQL(env, from, at), opts); aerr == nil {
+		allocCPU, allocMem = chquery.ParseCapacityAllocatable(allocRes.Maps())
+	} else {
+		logger.Warn("capacity CH allocatable optional query failed", "error", aerr)
+	}
+
+	return a.aggregateCapacity(chquery.CapacityLedgerToResultMap(rows, allocCPU, allocMem))
 }
 
 // ---------------------------------------------------------------------------
@@ -750,16 +798,35 @@ func riskRowsFromResults(underCPU, underMem, throttled []queries.PromResult) []C
 // Recommendations (CAP-3)
 // ---------------------------------------------------------------------------
 
-func (a *App) resolveRecommendations(ctx context.Context, namespace, env string, from, to time.Time) CapacityRecommendationsResponse {
+func (a *App) resolveRecommendations(ctx context.Context, req *http.Request, namespace, env string, from, to time.Time) CapacityRecommendationsResponse {
 	empty := CapacityRecommendationsResponse{
 		Available:       false,
 		EnablementNote:  capacityEnablementNote,
 		Recommendations: []WorkloadRecommendation{},
 	}
-	if a.prom(ctx) == nil {
-		return empty
+	if a.prom(ctx) != nil {
+		resp := a.queryRecommendations(ctx, namespace, env, from, to)
+		if resp.Available {
+			return resp
+		}
+		if ch := a.chForRequest(req); ch != nil {
+			chResp := a.queryRecommendationsClickHouse(ctx, ch, namespace, env, from, to)
+			if chResp.Available {
+				return chResp
+			}
+			if chResp.EnablementNote != "" {
+				resp.EnablementNote = chResp.EnablementNote
+			}
+		}
+		if resp.EnablementNote == "" {
+			resp.EnablementNote = capacityEnablementNote
+		}
+		return resp
 	}
-	return a.queryRecommendations(ctx, namespace, env, from, to)
+	if ch := a.chForRequest(req); ch != nil {
+		return a.queryRecommendationsClickHouse(ctx, ch, namespace, env, from, to)
+	}
+	return empty
 }
 
 func (a *App) queryRecommendations(ctx context.Context, namespace, env string, from, to time.Time) CapacityRecommendationsResponse {
@@ -796,7 +863,110 @@ func (a *App) queryRecommendations(ctx context.Context, namespace, env string, f
 		{"podOwner", fmt.Sprintf(`%s{%s}`, ctr.PodOwner, namespaceOnlyScope(namespace))},
 	}
 	resultMap := a.runInstantQueries(ctx, to, jobs, logger)
+	return a.aggregateRecommendations(resultMap, env, window)
+}
 
+func (a *App) queryRecommendationsClickHouse(ctx context.Context, ch *queries.ClickHouseClient, namespace, env string, from, to time.Time) CapacityRecommendationsResponse {
+	logger := log.DefaultLogger.With("handler", "capacity-recs-clickhouse")
+	empty := CapacityRecommendationsResponse{
+		Available: false, EnablementNote: capacityEnablementNote, Recommendations: []WorkloadRecommendation{},
+	}
+	if ch == nil {
+		return empty
+	}
+	window := to.Sub(from)
+	if window < time.Hour {
+		window = time.Hour
+	}
+	opts := queries.ClickHouseQueryOptions{From: from, To: to, Limit: 5000, SkipLimitEnforcement: true}
+
+	usageRes, err := ch.Query(ctx, chquery.CapacityUsageProbeSQL(from, to), opts)
+	if err != nil {
+		logger.Warn("capacity recs CH usage probe failed", "error", err)
+		return empty
+	}
+	ksmRes, err := ch.Query(ctx, chquery.CapacityKSMProbeSQL(from, to), opts)
+	if err != nil {
+		logger.Warn("capacity recs CH KSM probe failed", "error", err)
+		return empty
+	}
+	hasUsage := chquery.ParseCapacityProbeCount(usageRes.Maps()) > 0
+	hasKSM := chquery.ParseCapacityProbeCount(ksmRes.Maps()) > 0
+	switch {
+	case !hasUsage && !hasKSM:
+		return empty
+	case !hasUsage:
+		empty.EnablementNote = capacityCHMissingUsageNote
+		return empty
+	case !hasKSM:
+		empty.EnablementNote = capacityCHMissingKSMNote
+		return empty
+	}
+
+	bucketRes, err := ch.Query(ctx, chquery.CapacityRecsBucketSQL(namespace, env, from, to), opts)
+	if err != nil {
+		logger.Warn("capacity recs CH bucket query failed", "error", err)
+		return empty
+	}
+	ownerRes, err := ch.Query(ctx, chquery.CapacityPodOwnerSQL(namespace, env, from, to), opts)
+	if err != nil {
+		logger.Warn("capacity recs CH owner query failed", "error", err)
+		ownerRes = nil
+	}
+	var owners []chquery.CapacityOwner
+	if ownerRes != nil {
+		owners = chquery.ParseCapacityOwners(ownerRes.Maps())
+	}
+	rm := capacityRecsCHToResultMap(chquery.ParseCapacityRecRows(bucketRes.Maps()), owners)
+	return a.aggregateRecommendations(rm, env, window)
+}
+
+func capacityPromMetric(labels map[string]string, v float64) queries.PromResult {
+	m := make(map[string]string, len(labels))
+	for k, val := range labels {
+		if val != "" {
+			m[k] = val
+		}
+	}
+	return queries.PromResult{Metric: m, Value: queries.NewPromValue(0, strconv.FormatFloat(v, 'f', -1, 64))}
+}
+
+func capacityRecsCHToResultMap(rows []chquery.CapacityRecRow, owners []chquery.CapacityOwner) map[string][]queries.PromResult {
+	rm := map[string][]queries.PromResult{
+		"cpuP95": {}, "cpuP50": {}, "cpuMax": {},
+		"memP95": {}, "memMax": {},
+		"cpuReq": {}, "memReq": {}, "cpuLim": {}, "memLim": {},
+		"throttled": {}, "podOwner": {},
+	}
+	for _, r := range rows {
+		labels := map[string]string{
+			"namespace": r.Namespace, "pod": r.Pod, "container": r.Container, "k8s_cluster_name": r.Cluster,
+		}
+		rm["cpuP95"] = append(rm["cpuP95"], capacityPromMetric(labels, r.CPUP95))
+		rm["cpuP50"] = append(rm["cpuP50"], capacityPromMetric(labels, r.CPUP50))
+		rm["cpuMax"] = append(rm["cpuMax"], capacityPromMetric(labels, r.CPUMax))
+		rm["memP95"] = append(rm["memP95"], capacityPromMetric(labels, r.MemP95))
+		rm["memMax"] = append(rm["memMax"], capacityPromMetric(labels, r.MemMax))
+		rm["cpuReq"] = append(rm["cpuReq"], capacityPromMetric(labels, r.ReqCPU))
+		rm["memReq"] = append(rm["memReq"], capacityPromMetric(labels, r.ReqMem))
+		if r.LimCPU > 0 {
+			rm["cpuLim"] = append(rm["cpuLim"], capacityPromMetric(labels, r.LimCPU))
+		}
+		rm["memLim"] = append(rm["memLim"], capacityPromMetric(labels, r.LimMem))
+		if r.Throttled > 0 {
+			rm["throttled"] = append(rm["throttled"], capacityPromMetric(labels, r.Throttled))
+		}
+	}
+	for _, o := range owners {
+		rm["podOwner"] = append(rm["podOwner"], capacityPromMetric(map[string]string{
+			"namespace": o.Namespace, "pod": o.Pod,
+			"owner_kind": o.Kind, "owner_name": o.Name, "k8s_cluster_name": o.Cluster,
+		}, 1))
+	}
+	return rm
+}
+
+func (a *App) aggregateRecommendations(resultMap map[string][]queries.PromResult, env string, window time.Duration) CapacityRecommendationsResponse {
 	type id struct{ ns, pod, container string }
 	obs := map[id]*WorkloadRecommendation{}
 
@@ -839,7 +1009,6 @@ func (a *App) queryRecommendations(ctx context.Context, namespace, env string, f
 	upsert(resultMap["memLim"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Current.MemLim = v })
 	upsert(resultMap["throttled"], func(rec *WorkloadRecommendation, v float64, _ map[string]string) { rec.Observed.ThrottledRate = v })
 
-	// Resolve workload from kube_pod_owner keyed by pod.
 	ownerByPod := map[string]struct{ kind, name string }{}
 	for _, r := range resultMap["podOwner"] {
 		pod := r.Metric["pod"]
@@ -862,7 +1031,6 @@ func (a *App) queryRecommendations(ctx context.Context, namespace, env string, f
 	}
 	cpuHour, memHour := capacityCostRates(rates)
 
-	// Collapse pods → workload+container.
 	type wk struct{ ns, kind, name, container string }
 	byWorkload := map[wk]*WorkloadRecommendation{}
 	for k, rec := range obs {
@@ -962,7 +1130,7 @@ func formatPromDuration(d time.Duration) string {
 // History (CAP-4)
 // ---------------------------------------------------------------------------
 
-func (a *App) resolveHistory(ctx context.Context, namespace, workload, container, env string, from, to time.Time) CapacityHistoryResponse {
+func (a *App) resolveHistory(ctx context.Context, req *http.Request, namespace, workload, container, env string, from, to time.Time) CapacityHistoryResponse {
 	note := "Only series still present in the metrics backend for this range are shown. Deleted workloads are not reconstructed."
 	empty := CapacityHistoryResponse{
 		Available:      false,
@@ -970,8 +1138,41 @@ func (a *App) resolveHistory(ctx context.Context, namespace, workload, container
 		Series:         []CapacityHistorySeries{},
 		Note:           note,
 	}
+	if namespace == "" {
+		return empty
+	}
+	if a.prom(ctx) != nil {
+		resp := a.queryHistoryProm(ctx, namespace, workload, container, env, from, to)
+		if resp.Available {
+			return resp
+		}
+		if ch := a.chForRequest(req); ch != nil {
+			chResp := a.queryHistoryClickHouse(ctx, ch, namespace, container, env, from, to)
+			if chResp.Available {
+				return chResp
+			}
+			if chResp.EnablementNote != "" {
+				resp.EnablementNote = chResp.EnablementNote
+			}
+		}
+		if resp.EnablementNote == "" {
+			resp.EnablementNote = capacityEnablementNote
+		}
+		return resp
+	}
+	if ch := a.chForRequest(req); ch != nil {
+		return a.queryHistoryClickHouse(ctx, ch, namespace, container, env, from, to)
+	}
+	return empty
+}
+
+func (a *App) queryHistoryProm(ctx context.Context, namespace, workload, container, env string, from, to time.Time) CapacityHistoryResponse {
+	note := "Only series still present in the metrics backend for this range are shown. Deleted workloads are not reconstructed."
+	empty := CapacityHistoryResponse{
+		Available: false, EnablementNote: capacityEnablementNote, Series: []CapacityHistorySeries{}, Note: note,
+	}
 	client := a.prom(ctx)
-	if client == nil || namespace == "" {
+	if client == nil {
 		return empty
 	}
 	ctr := a.otelCfg.Runtime.Container
@@ -979,9 +1180,9 @@ func (a *App) resolveHistory(ctx context.Context, namespace, workload, container
 	if container != "" {
 		scope += fmt.Sprintf(`,container="%s"`, container)
 	}
-	_ = workload // workload filter applied via pod regex when owners are resolved; v1 scopes by namespace/container
+	_ = workload
 
-	step := (to.Sub(from) / 50)
+	step := to.Sub(from) / 50
 	if step < 15*time.Second {
 		step = 15 * time.Second
 	}
@@ -1040,11 +1241,70 @@ func (a *App) resolveHistory(ctx context.Context, namespace, workload, container
 	return CapacityHistoryResponse{Available: true, Series: series, Note: note}
 }
 
+func (a *App) queryHistoryClickHouse(ctx context.Context, ch *queries.ClickHouseClient, namespace, container, env string, from, to time.Time) CapacityHistoryResponse {
+	logger := log.DefaultLogger.With("handler", "capacity-history-clickhouse")
+	note := "Only series still present in the metrics backend for this range are shown. Deleted workloads are not reconstructed."
+	empty := CapacityHistoryResponse{
+		Available: false, EnablementNote: capacityEnablementNote, Series: []CapacityHistorySeries{}, Note: note,
+	}
+	if ch == nil {
+		return empty
+	}
+	opts := queries.ClickHouseQueryOptions{From: from, To: to, Limit: 5000, SkipLimitEnforcement: true}
+
+	usageRes, err := ch.Query(ctx, chquery.CapacityUsageProbeSQL(from, to), opts)
+	if err != nil {
+		logger.Warn("capacity history CH usage probe failed", "error", err)
+		return empty
+	}
+	if chquery.ParseCapacityProbeCount(usageRes.Maps()) <= 0 {
+		ksmRes, kerr := ch.Query(ctx, chquery.CapacityKSMProbeSQL(from, to), opts)
+		if kerr == nil && chquery.ParseCapacityProbeCount(ksmRes.Maps()) > 0 {
+			empty.EnablementNote = capacityCHMissingUsageNote
+		}
+		return empty
+	}
+
+	step := int((to.Sub(from) / 50).Seconds())
+	if step < 15 {
+		step = 15
+	}
+	histRes, err := ch.Query(ctx, chquery.CapacityHistorySeriesSQL(namespace, container, env, from, to, step), opts)
+	if err != nil {
+		logger.Warn("capacity history CH series failed", "error", err)
+		return empty
+	}
+	rows := chquery.ParseCapacityHistoryRows(histRes.Maps())
+	if len(rows) == 0 {
+		return empty
+	}
+
+	appendSeries := func(name string, get func(chquery.CapacityHistoryPointRow) float64) CapacityHistorySeries {
+		pts := make([]CapacityHistoryPoint, 0, len(rows))
+		for _, r := range rows {
+			pts = append(pts, CapacityHistoryPoint{TimestampMs: r.BucketMs, Value: roundTo(get(r), 4)})
+		}
+		return CapacityHistorySeries{Name: name, Points: pts}
+	}
+	series := []CapacityHistorySeries{
+		appendSeries("cpuUsage", func(r chquery.CapacityHistoryPointRow) float64 { return r.CPUUsage }),
+		appendSeries("cpuRequest", func(r chquery.CapacityHistoryPointRow) float64 { return r.CPURequest }),
+		appendSeries("cpuLimit", func(r chquery.CapacityHistoryPointRow) float64 { return r.CPULimit }),
+		appendSeries("memUsage", func(r chquery.CapacityHistoryPointRow) float64 { return r.MemUsage }),
+		appendSeries("memRequest", func(r chquery.CapacityHistoryPointRow) float64 { return r.MemRequest }),
+		appendSeries("memLimit", func(r chquery.CapacityHistoryPointRow) float64 { return r.MemLimit }),
+		appendSeries("cpuThrottled", func(r chquery.CapacityHistoryPointRow) float64 { return r.CPUThrottled }),
+		appendSeries("restarts", func(r chquery.CapacityHistoryPointRow) float64 { return r.Restarts }),
+	}
+	sort.Slice(series, func(i, j int) bool { return series[i].Name < series[j].Name })
+	return CapacityHistoryResponse{Available: true, Series: series, Note: note}
+}
+
 // ---------------------------------------------------------------------------
 // Forecast (CAP-5)
 // ---------------------------------------------------------------------------
 
-func (a *App) resolveForecast(ctx context.Context, resource, namespace, workload, container, env string, from, to time.Time) CapacityForecastResponse {
+func (a *App) resolveForecast(ctx context.Context, req *http.Request, resource, namespace, workload, container, env string, from, to time.Time) CapacityForecastResponse {
 	empty := CapacityForecastResponse{
 		Available:      false,
 		EnablementNote: capacityEnablementNote,
@@ -1053,8 +1313,41 @@ func (a *App) resolveForecast(ctx context.Context, resource, namespace, workload
 		Resource:       resource,
 		Series:         []CapacityHistorySeries{},
 	}
+	if namespace == "" {
+		return empty
+	}
+	if a.prom(ctx) != nil {
+		resp := a.queryForecastProm(ctx, resource, namespace, workload, container, env, from, to)
+		if resp.Available {
+			return resp
+		}
+		if ch := a.chForRequest(req); ch != nil {
+			chResp := a.queryForecastClickHouse(ctx, ch, resource, namespace, container, env, from, to)
+			if chResp.Available {
+				return chResp
+			}
+			if chResp.EnablementNote != "" {
+				resp.EnablementNote = chResp.EnablementNote
+			}
+		}
+		if resp.EnablementNote == "" {
+			resp.EnablementNote = capacityEnablementNote
+		}
+		return resp
+	}
+	if ch := a.chForRequest(req); ch != nil {
+		return a.queryForecastClickHouse(ctx, ch, resource, namespace, container, env, from, to)
+	}
+	return empty
+}
+
+func (a *App) queryForecastProm(ctx context.Context, resource, namespace, workload, container, env string, from, to time.Time) CapacityForecastResponse {
+	empty := CapacityForecastResponse{
+		Available: false, EnablementNote: capacityEnablementNote,
+		Method: "linear", MethodLabel: "linear projection", Resource: resource, Series: []CapacityHistorySeries{},
+	}
 	client := a.prom(ctx)
-	if client == nil || namespace == "" {
+	if client == nil {
 		return empty
 	}
 	ctr := a.otelCfg.Runtime.Container
@@ -1080,7 +1373,6 @@ func (a *App) resolveForecast(ctx context.Context, resource, namespace, workload
 	}
 
 	window := to.Sub(from)
-	// Subquery form: predict_linear needs a range vector over an instant-vector expression.
 	predictExpr := fmt.Sprintf(
 		`predict_linear((%s)[%s:], %d)`,
 		usageExpr, formatPromDuration(window), int((7 * 24 * time.Hour).Seconds()),
@@ -1145,12 +1437,104 @@ func (a *App) resolveForecast(ctx context.Context, resource, namespace, workload
 		return empty
 	}
 	return CapacityForecastResponse{
-		Available:     true,
-		Method:        "linear",
-		MethodLabel:   "linear projection",
-		Resource:      resource,
-		Series:        series,
-		DaysToRequest: daysToReq,
-		DaysToLimit:   daysToLim,
+		Available: true, Method: "linear", MethodLabel: "linear projection",
+		Resource: resource, Series: series, DaysToRequest: daysToReq, DaysToLimit: daysToLim,
+	}
+}
+
+func (a *App) queryForecastClickHouse(ctx context.Context, ch *queries.ClickHouseClient, resource, namespace, container, env string, from, to time.Time) CapacityForecastResponse {
+	logger := log.DefaultLogger.With("handler", "capacity-forecast-clickhouse")
+	empty := CapacityForecastResponse{
+		Available: false, EnablementNote: capacityEnablementNote,
+		Method: "linear", MethodLabel: "linear projection", Resource: resource, Series: []CapacityHistorySeries{},
+	}
+	if ch == nil {
+		return empty
+	}
+	opts := queries.ClickHouseQueryOptions{From: from, To: to, Limit: 5000, SkipLimitEnforcement: true}
+
+	usageRes, err := ch.Query(ctx, chquery.CapacityUsageProbeSQL(from, to), opts)
+	if err != nil {
+		logger.Warn("capacity forecast CH usage probe failed", "error", err)
+		return empty
+	}
+	if chquery.ParseCapacityProbeCount(usageRes.Maps()) <= 0 {
+		ksmRes, kerr := ch.Query(ctx, chquery.CapacityKSMProbeSQL(from, to), opts)
+		if kerr == nil && chquery.ParseCapacityProbeCount(ksmRes.Maps()) > 0 {
+			empty.EnablementNote = capacityCHMissingUsageNote
+		}
+		return empty
+	}
+
+	step := int((to.Sub(from) / 50).Seconds())
+	if step < 15 {
+		step = 15
+	}
+	histRes, err := ch.Query(ctx, chquery.CapacityHistorySeriesSQL(namespace, container, env, from, to, step), opts)
+	if err != nil {
+		logger.Warn("capacity forecast CH series failed", "error", err)
+		return empty
+	}
+	rows := chquery.ParseCapacityHistoryRows(histRes.Maps())
+	if len(rows) == 0 {
+		return empty
+	}
+
+	usagePts := make([]CapacityHistoryPoint, 0, len(rows))
+	fitPts := make([]struct {
+		T int64
+		V float64
+	}, 0, len(rows))
+	var curReq, curLim float64
+	for _, r := range rows {
+		var v float64
+		if resource == "memory" {
+			v = r.MemUsage
+			curReq = r.MemRequest
+			curLim = r.MemLimit
+		} else {
+			v = r.CPUUsage
+			curReq = r.CPURequest
+			curLim = r.CPULimit
+		}
+		usagePts = append(usagePts, CapacityHistoryPoint{TimestampMs: r.BucketMs, Value: roundTo(v, 4)})
+		fitPts = append(fitPts, struct {
+			T int64
+			V float64
+		}{r.BucketMs, v})
+	}
+
+	series := []CapacityHistorySeries{{Name: "usage", Points: usagePts}}
+	horizon := float64((7 * 24 * time.Hour).Seconds())
+	pred, slopePerSec, ok := chquery.LinearForecast(fitPts, horizon)
+	var curUsage float64
+	if len(usagePts) > 0 {
+		curUsage = usagePts[len(usagePts)-1].Value
+	}
+	if ok {
+		series = append(series, CapacityHistorySeries{
+			Name: "forecast",
+			Points: []CapacityHistoryPoint{
+				{TimestampMs: to.UnixMilli(), Value: curUsage},
+				{TimestampMs: to.Add(7 * 24 * time.Hour).UnixMilli(), Value: roundTo(pred, 4)},
+			},
+		})
+	}
+
+	var daysToReq, daysToLim *float64
+	if ok && slopePerSec > 0 && curUsage > 0 {
+		if curReq > curUsage {
+			d := (curReq - curUsage) / slopePerSec / 86400
+			daysToReq = &d
+		}
+		if curLim > curUsage {
+			d := (curLim - curUsage) / slopePerSec / 86400
+			daysToLim = &d
+		}
+	}
+
+	return CapacityForecastResponse{
+		Available: true, Method: "linear", MethodLabel: "linear projection",
+		Resource: resource, Series: series, DaysToRequest: daysToReq, DaysToLimit: daysToLim,
 	}
 }
