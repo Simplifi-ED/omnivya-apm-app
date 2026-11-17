@@ -7,5 +7,8 @@ module.exports = {
     // Keep as warn: several PR commits already have single-paragraph bodies >100 chars,
     // and rewriting pushed history requires force-push (disallowed).
     'body-max-line-length': [1, 'always', 100],
+    // Acronyms in subjects (VPA, YAML) trip sentence-case; rewriting pushed commits
+    // would need force-push (disallowed).
+    'subject-case': [1, 'never', ['sentence-case', 'start-case', 'pascal-case', 'upper-case']],
   },
 };
