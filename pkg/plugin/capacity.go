@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"regexp"
 	"sort"
@@ -165,8 +166,11 @@ type WorkloadResources struct {
 // WorkloadObserved is historical usage used for right-sizing.
 type WorkloadObserved struct {
 	CPUP50        float64 `json:"cpuP50"`
+	CPUP90        float64 `json:"cpuP90"`
 	CPUP95        float64 `json:"cpuP95"`
 	CPUMax        float64 `json:"cpuMax"`
+	MemP50        float64 `json:"memP50"`
+	MemP90        float64 `json:"memP90"`
 	MemP95        float64 `json:"memP95"`
 	MemMax        float64 `json:"memMax"`
 	ThrottledRate float64 `json:"throttledRate"`
@@ -183,12 +187,15 @@ type WorkloadRecommendation struct {
 	Confidence            string            `json:"confidence"`
 	Current               WorkloadResources `json:"current"`
 	Observed              WorkloadObserved  `json:"observed"`
+	Bounds                WorkloadBounds    `json:"bounds"`
 	Burstable             WorkloadResources `json:"burstable"`
 	Guaranteed            WorkloadResources `json:"guaranteed"`
 	ReclaimableMonthlyUSD float64           `json:"reclaimableMonthlyUsd"`
 	DeficitMonthlyUSD     float64           `json:"deficitMonthlyUsd"`
 	YAMLPatch             string            `json:"yamlPatch"`
+	YAMLPatchGuaranteed   string            `json:"yamlPatchGuaranteed"`
 	QoSClass              string            `json:"qosClass"`
+	Notes                 []string          `json:"notes,omitempty"`
 }
 
 // CapacityRecommendationsResponse is GET /capacity/recommendations.
@@ -1297,9 +1304,12 @@ func (a *App) queryRecommendations(ctx context.Context, namespace, env string, f
 
 	jobs := []QueryJob{
 		{"cpuP95", fmt.Sprintf(`quantile_over_time(0.95, (%s)[%s:])`, cpuRate, win)},
+		{"cpuP90", fmt.Sprintf(`quantile_over_time(0.90, (%s)[%s:])`, cpuRate, win)},
 		{"cpuMax", fmt.Sprintf(`max_over_time((%s)[%s:])`, cpuRate, win)},
 		{"cpuP50", fmt.Sprintf(`quantile_over_time(0.50, (%s)[%s:])`, cpuRate, win)},
 		{"memP95", fmt.Sprintf(`quantile_over_time(0.95, (%s)[%s:])`, memUsage, win)},
+		{"memP90", fmt.Sprintf(`quantile_over_time(0.90, (%s)[%s:])`, memUsage, win)},
+		{"memP50", fmt.Sprintf(`quantile_over_time(0.50, (%s)[%s:])`, memUsage, win)},
 		{"memMax", fmt.Sprintf(`max_over_time((%s)[%s:])`, memUsage, win)},
 		{"cpuReq", cpuReq},
 		{"memReq", memReq},
@@ -1382,8 +1392,8 @@ func capacityPromMetric(labels map[string]string, v float64) queries.PromResult 
 
 func capacityRecsCHToResultMap(rows []chquery.CapacityRecRow, owners []chquery.CapacityOwner) map[string][]queries.PromResult {
 	rm := map[string][]queries.PromResult{
-		"cpuP95": {}, "cpuP50": {}, "cpuMax": {},
-		"memP95": {}, "memMax": {},
+		"cpuP95": {}, "cpuP90": {}, "cpuP50": {}, "cpuMax": {},
+		"memP95": {}, "memP90": {}, "memP50": {}, "memMax": {},
 		"cpuReq": {}, "memReq": {}, "cpuLim": {}, "memLim": {},
 		"throttled": {}, "podOwner": {},
 	}
@@ -1392,9 +1402,12 @@ func capacityRecsCHToResultMap(rows []chquery.CapacityRecRow, owners []chquery.C
 			"namespace": r.Namespace, "pod": r.Pod, "container": r.Container, "k8s_cluster_name": r.Cluster,
 		}
 		rm["cpuP95"] = append(rm["cpuP95"], capacityPromMetric(labels, r.CPUP95))
+		rm["cpuP90"] = append(rm["cpuP90"], capacityPromMetric(labels, r.CPUP90))
 		rm["cpuP50"] = append(rm["cpuP50"], capacityPromMetric(labels, r.CPUP50))
 		rm["cpuMax"] = append(rm["cpuMax"], capacityPromMetric(labels, r.CPUMax))
 		rm["memP95"] = append(rm["memP95"], capacityPromMetric(labels, r.MemP95))
+		rm["memP90"] = append(rm["memP90"], capacityPromMetric(labels, r.MemP90))
+		rm["memP50"] = append(rm["memP50"], capacityPromMetric(labels, r.MemP50))
 		rm["memMax"] = append(rm["memMax"], capacityPromMetric(labels, r.MemMax))
 		rm["cpuReq"] = append(rm["cpuReq"], capacityPromMetric(labels, r.ReqCPU))
 		rm["memReq"] = append(rm["memReq"], capacityPromMetric(labels, r.ReqMem))
@@ -1417,20 +1430,51 @@ func capacityRecsCHToResultMap(rows []chquery.CapacityRecRow, owners []chquery.C
 
 type capacityPodID struct{ ns, pod, container, cluster string }
 
+// capacityQuantilesSeen records which of the four window quantiles arrived for
+// one resource. A recommendation only claims bounds when all four are present,
+// because a missing quantile would silently enter the math as zero.
+type capacityQuantilesSeen struct{ p50, p90, p95, max bool }
+
+func (s capacityQuantilesSeen) complete() bool { return s.p50 && s.p90 && s.p95 && s.max }
+func (s capacityQuantilesSeen) any() bool      { return s.p50 || s.p90 || s.p95 || s.max }
+func (s capacityQuantilesSeen) or(o capacityQuantilesSeen) capacityQuantilesSeen {
+	return capacityQuantilesSeen{
+		p50: s.p50 || o.p50, p90: s.p90 || o.p90, p95: s.p95 || o.p95, max: s.max || o.max,
+	}
+}
+
 type capacityObsRec struct {
-	rec                  *WorkloadRecommendation
-	hasCPUObs, hasMemObs bool
+	rec     *WorkloadRecommendation
+	cpuSeen capacityQuantilesSeen
+	memSeen capacityQuantilesSeen
 }
 
 type capacityWkKey struct{ ns, kind, name, container, cluster string }
 
 type capacityWkAgg struct {
-	rec                  *WorkloadRecommendation
-	hasCPUObs, hasMemObs bool
+	rec     *WorkloadRecommendation
+	cpuSeen capacityQuantilesSeen
+	memSeen capacityQuantilesSeen
+}
+
+// maxObserved is the elementwise max. One recommendation covers every replica,
+// so each bound must satisfy the worst one.
+func maxObserved(a, b WorkloadObserved) WorkloadObserved {
+	return WorkloadObserved{
+		CPUP50:        math.Max(a.CPUP50, b.CPUP50),
+		CPUP90:        math.Max(a.CPUP90, b.CPUP90),
+		CPUP95:        math.Max(a.CPUP95, b.CPUP95),
+		CPUMax:        math.Max(a.CPUMax, b.CPUMax),
+		MemP50:        math.Max(a.MemP50, b.MemP50),
+		MemP90:        math.Max(a.MemP90, b.MemP90),
+		MemP95:        math.Max(a.MemP95, b.MemP95),
+		MemMax:        math.Max(a.MemMax, b.MemMax),
+		ThrottledRate: math.Max(a.ThrottledRate, b.ThrottledRate),
+	}
 }
 
 func (a *App) aggregateRecommendations(resultMap map[string][]queries.PromResult, env string, window time.Duration) CapacityRecommendationsResponse {
-	obs := collectCapacityObservations(resultMap, env, window)
+	obs := collectCapacityObservations(resultMap, env)
 	ownerByPod := capacityOwnerByPod(resultMap["podOwner"], resultMap["jobOwner"])
 	byWorkload := mergeCapacityByWorkload(obs, ownerByPod)
 
@@ -1442,7 +1486,7 @@ func (a *App) aggregateRecommendations(resultMap map[string][]queries.PromResult
 
 	out := make([]WorkloadRecommendation, 0, len(byWorkload))
 	for _, agg := range byWorkload {
-		if rec, ok := finalizeCapacityRecommendation(agg, cpuHour, memHour); ok {
+		if rec, ok := finalizeCapacityRecommendation(agg, window, cpuHour, memHour); ok {
 			out = append(out, rec)
 		}
 	}
@@ -1465,7 +1509,7 @@ func (a *App) aggregateRecommendations(resultMap map[string][]queries.PromResult
 	return CapacityRecommendationsResponse{Available: true, Recommendations: out}
 }
 
-func collectCapacityObservations(resultMap map[string][]queries.PromResult, env string, window time.Duration) map[capacityPodID]*capacityObsRec {
+func collectCapacityObservations(resultMap map[string][]queries.PromResult, env string) map[capacityPodID]*capacityObsRec {
 	obs := map[capacityPodID]*capacityObsRec{}
 	upsert := func(rs []queries.PromResult, apply func(*capacityObsRec, float64)) {
 		for _, r := range rs {
@@ -1485,11 +1529,10 @@ func collectCapacityObservations(resultMap map[string][]queries.PromResult, env 
 				}
 				entry = &capacityObsRec{
 					rec: &WorkloadRecommendation{
-						Namespace:   ns,
+						Namespace: ns,
 						Environment: envName,
-						Container:   c,
-						Replicas:    1,
-						Confidence:  capacityConfidence(window),
+						Container: c,
+						Replicas:  1,
 					},
 				}
 				obs[k] = entry
@@ -1497,11 +1540,14 @@ func collectCapacityObservations(resultMap map[string][]queries.PromResult, env 
 			apply(entry, safeFloat(r.Value.Float()))
 		}
 	}
-	upsert(resultMap["cpuP95"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUP95 = v; e.hasCPUObs = true })
-	upsert(resultMap["cpuP50"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUP50 = v; e.hasCPUObs = true })
-	upsert(resultMap["cpuMax"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUMax = v; e.hasCPUObs = true })
-	upsert(resultMap["memP95"], func(e *capacityObsRec, v float64) { e.rec.Observed.MemP95 = v; e.hasMemObs = true })
-	upsert(resultMap["memMax"], func(e *capacityObsRec, v float64) { e.rec.Observed.MemMax = v; e.hasMemObs = true })
+	upsert(resultMap["cpuP95"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUP95 = v; e.cpuSeen.p95 = true })
+	upsert(resultMap["cpuP90"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUP90 = v; e.cpuSeen.p90 = true })
+	upsert(resultMap["cpuP50"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUP50 = v; e.cpuSeen.p50 = true })
+	upsert(resultMap["cpuMax"], func(e *capacityObsRec, v float64) { e.rec.Observed.CPUMax = v; e.cpuSeen.max = true })
+	upsert(resultMap["memP95"], func(e *capacityObsRec, v float64) { e.rec.Observed.MemP95 = v; e.memSeen.p95 = true })
+	upsert(resultMap["memP90"], func(e *capacityObsRec, v float64) { e.rec.Observed.MemP90 = v; e.memSeen.p90 = true })
+	upsert(resultMap["memP50"], func(e *capacityObsRec, v float64) { e.rec.Observed.MemP50 = v; e.memSeen.p50 = true })
+	upsert(resultMap["memMax"], func(e *capacityObsRec, v float64) { e.rec.Observed.MemMax = v; e.memSeen.max = true })
 	upsert(resultMap["cpuReq"], func(e *capacityObsRec, v float64) { e.rec.Current.CPUReq = v })
 	upsert(resultMap["memReq"], func(e *capacityObsRec, v float64) { e.rec.Current.MemReq = v })
 	upsert(resultMap["cpuLim"], func(e *capacityObsRec, v float64) {
@@ -1569,24 +1615,13 @@ func mergeCapacityByWorkload(
 		if agg == nil {
 			rec.WorkloadKind = owner.kind
 			rec.WorkloadName = owner.name
-			byWorkload[wkey] = &capacityWkAgg{rec: rec, hasCPUObs: entry.hasCPUObs, hasMemObs: entry.hasMemObs}
+			byWorkload[wkey] = &capacityWkAgg{rec: rec, cpuSeen: entry.cpuSeen, memSeen: entry.memSeen}
 			continue
 		}
 		agg.rec.Replicas++
-		agg.hasCPUObs = agg.hasCPUObs || entry.hasCPUObs
-		agg.hasMemObs = agg.hasMemObs || entry.hasMemObs
-		if rec.Observed.CPUP95 > agg.rec.Observed.CPUP95 {
-			agg.rec.Observed.CPUP95 = rec.Observed.CPUP95
-		}
-		if rec.Observed.CPUMax > agg.rec.Observed.CPUMax {
-			agg.rec.Observed.CPUMax = rec.Observed.CPUMax
-		}
-		if rec.Observed.MemP95 > agg.rec.Observed.MemP95 {
-			agg.rec.Observed.MemP95 = rec.Observed.MemP95
-		}
-		if rec.Observed.MemMax > agg.rec.Observed.MemMax {
-			agg.rec.Observed.MemMax = rec.Observed.MemMax
-		}
+		agg.cpuSeen = agg.cpuSeen.or(entry.cpuSeen)
+		agg.memSeen = agg.memSeen.or(entry.memSeen)
+		agg.rec.Observed = maxObserved(agg.rec.Observed, rec.Observed)
 		// Current requests/limits stay per-replica (do not sum across pods).
 		if agg.rec.Current.CPUReq == 0 && rec.Current.CPUReq > 0 {
 			agg.rec.Current.CPUReq = rec.Current.CPUReq
@@ -1604,54 +1639,76 @@ func mergeCapacityByWorkload(
 	return byWorkload
 }
 
-func finalizeCapacityRecommendation(agg *capacityWkAgg, cpuHour, memHour float64) (WorkloadRecommendation, bool) {
+// finalizeCapacityRecommendation turns one workload's merged observations into a
+// single bounds triple, and projects every downstream field from it. Nothing is
+// computed twice, so the JSON numbers and the pasted YAML cannot drift.
+func finalizeCapacityRecommendation(agg *capacityWkAgg, window time.Duration, cpuHour, memHour float64) (WorkloadRecommendation, bool) {
 	rec := agg.rec
-	if !agg.hasCPUObs && !agg.hasMemObs {
+	if !agg.cpuSeen.any() && !agg.memSeen.any() {
 		return WorkloadRecommendation{}, false
 	}
-	var cpuReq, memReq, memLim float64
-	var gCPU, gCPULim, gMem, gMemLim float64
-	if agg.hasCPUObs {
-		cpuReq, _, _ = burstableRecommendation(rec.Observed.CPUP95, 0, 0)
-		gCPU, gCPULim, _, _ = guaranteedRecommendation(rec.Observed.CPUMax, 0)
+
+	days := capacityConfidenceDays(window)
+	lowerMult, upperMult := capacityConfidenceMultipliers(days)
+	rec.Confidence = capacityConfidence(days)
+
+	if agg.cpuSeen.complete() {
+		q := monotoneQuantiles(rec.Observed.CPUP50, rec.Observed.CPUP90, rec.Observed.CPUP95, rec.Observed.CPUMax)
+		b := capacityResourceBounds(q, lowerMult, upperMult, cpuTargetIgnoresPeak).quantized(ceilCPUCores)
+		guarded := applyThrottleGuard(b, rec.Observed.ThrottledRate, rec.Current.CPULim)
+		if guarded != b {
+			rec.Notes = append(rec.Notes, "CPU limit raised to the current limit: this container is throttling, so shrinking the limit would keep it throttled.")
+		}
+		rec.Bounds.CPU = &guarded
+	} else if agg.cpuSeen.any() {
+		rec.Notes = append(rec.Notes, "CPU bounds omitted: the window is missing one of p50/p90/p95/max.")
 	}
-	if agg.hasMemObs {
-		_, memReq, memLim = burstableRecommendation(0, rec.Observed.MemP95, rec.Observed.MemMax)
-		_, _, gMem, gMemLim = guaranteedRecommendation(0, rec.Observed.MemMax)
+
+	if agg.memSeen.complete() {
+		q := monotoneQuantiles(rec.Observed.MemP50, rec.Observed.MemP90, rec.Observed.MemP95, rec.Observed.MemMax)
+		b := capacityResourceBounds(q, lowerMult, upperMult, memTargetFloorsAtPeak).quantized(ceilMemoryBytes)
+		rec.Bounds.Mem = &b
+	} else if agg.memSeen.any() {
+		rec.Notes = append(rec.Notes, "Memory bounds omitted: the window is missing one of p50/p90/p95/max.")
 	}
-	rec.Burstable = WorkloadResources{CPUReq: cpuReq, MemReq: memReq, MemLim: memLim}
-	gLim := gCPULim
-	guaranteed := WorkloadResources{MemReq: gMem, MemLim: gMemLim}
-	if agg.hasCPUObs {
-		guaranteed.CPUReq = gCPU
-		guaranteed.CPULim = &gLim
+
+	if rec.Bounds.CPU == nil && rec.Bounds.Mem == nil {
+		return WorkloadRecommendation{}, false
 	}
-	rec.Guaranteed = guaranteed
+
+	rec.Burstable = burstableFromBounds(rec.Bounds)
+	rec.Guaranteed = guaranteedFromBounds(rec.Bounds)
+	rec.YAMLPatch = capacityResourcesYAML(rec.Burstable)
+	rec.YAMLPatchGuaranteed = capacityResourcesYAML(rec.Guaranteed)
+
 	var curLim float64
 	if rec.Current.CPULim != nil {
 		curLim = *rec.Current.CPULim
 	}
 	rec.QoSClass = qosClass(rec.Current.CPUReq, curLim, rec.Current.MemReq, rec.Current.MemLim)
-	rec.YAMLPatch = resourcesYAMLPatchSelective(cpuReq, agg.hasCPUObs, nil, memReq, memLim, agg.hasMemObs)
+
+	// Reclaim/deficit stay measured against the observed p95, not the new
+	// recommendation. Moving them to the lower bound is its own diff because it
+	// reorders the table.
 	reps := float64(rec.Replicas)
 	if reps < 1 {
 		reps = 1
 	}
 	wasteCPU := clampMin0(rec.Current.CPUReq - rec.Observed.CPUP95)
 	wasteMem := clampMin0(rec.Current.MemReq - rec.Observed.MemP95)
-	if !agg.hasCPUObs {
+	if !agg.cpuSeen.any() {
 		wasteCPU = 0
 	}
-	if !agg.hasMemObs {
+	if !agg.memSeen.any() {
 		wasteMem = 0
 	}
 	rec.ReclaimableMonthlyUSD = roundTo(monthlyUSD(wasteCPU*reps, wasteMem*reps, cpuHour, memHour), 2)
 	defCPU := clampMin0(rec.Observed.CPUP95 - rec.Current.CPUReq)
 	defMem := clampMin0(rec.Observed.MemP95 - rec.Current.MemReq)
-	if !agg.hasCPUObs {
+	if !agg.cpuSeen.any() {
 		defCPU = 0
 	}
-	if !agg.hasMemObs {
+	if !agg.memSeen.any() {
 		defMem = 0
 	}
 	rec.DeficitMonthlyUSD = roundTo(monthlyUSD(defCPU*reps, defMem*reps, cpuHour, memHour), 2)

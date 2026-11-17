@@ -133,6 +133,7 @@ function Capacity() {
   const tabParam = (searchParams.get('capTab') as CapTab) || 'overview';
   const tab: CapTab = ['overview', 'namespaces', 'nodes', 'rightsizing'].includes(tabParam) ? tabParam : 'overview';
   const [selectedRecKey, setSelectedRecKey] = useState<string | null>(null);
+  const [recYamlProfile, setRecYamlProfile] = useState<'burstable' | 'guaranteed'>('burstable');
   const [predict, setPredict] = useState<PredictTarget | null>(null);
 
   // Always load overview so ns/env Combobox options work on a direct rightsizing landing.
@@ -243,6 +244,7 @@ function Capacity() {
   // keeps the same from/to params while only fromMs/toMs move, so selection stays.
   useEffect(() => {
     setSelectedRecKey(null);
+    setRecYamlProfile('burstable');
   }, [from, to, nsFilter, env]);
 
   const selectedRec = useMemo(() => {
@@ -251,6 +253,13 @@ function Capacity() {
     }
     return recommendations.find((r) => recIdentity(r) === selectedRecKey) ?? null;
   }, [recommendations, selectedRecKey]);
+
+  const selectedYaml =
+    selectedRec == null
+      ? ''
+      : recYamlProfile === 'guaranteed'
+        ? selectedRec.yamlPatchGuaranteed
+        : selectedRec.yamlPatch;
 
   const nsColumns = useMemo<Array<Column<CapacityNamespaceRollup>>>(
     () => [
@@ -753,14 +762,35 @@ function Capacity() {
             {selectedRec && (
               <Drawer
                 title={`${selectedRec.workloadName} / ${selectedRec.container}`}
-                onClose={() => setSelectedRecKey(null)}
+                onClose={() => {
+                  setSelectedRecKey(null);
+                  setRecYamlProfile('burstable');
+                }}
               >
                 <Stack direction="column" gap={2}>
-                  <TextArea value={selectedRec.yamlPatch} readOnly rows={16} />
+                  <RadioButtonGroup
+                    options={[
+                      { label: 'Burstable', value: 'burstable' as const },
+                      { label: 'Guaranteed', value: 'guaranteed' as const },
+                    ]}
+                    value={recYamlProfile}
+                    onChange={setRecYamlProfile}
+                  />
+                  <Text variant="bodySmall" color="secondary">
+                    {recYamlProfile === 'burstable'
+                      ? 'Burstable: requests are the p50 lower bound, limits are the peak-floored upper bound, so a startup burst still fits.'
+                      : 'Guaranteed sets request = limit = the p90 target. Reservations rise and the burst range collapses, so usage above the target will throttle. Memory still respects the observed peak.'}
+                  </Text>
+                  {selectedRec.notes && selectedRec.notes.length > 0 && (
+                    <Alert severity="info" title="Recommendation notes">
+                      {selectedRec.notes.join(' ')}
+                    </Alert>
+                  )}
+                  <TextArea value={selectedYaml} readOnly rows={16} />
                   <Stack direction="row" gap={1}>
                     <Button
                       onClick={() => {
-                        void navigator.clipboard.writeText(selectedRec.yamlPatch);
+                        void navigator.clipboard.writeText(selectedYaml);
                       }}
                     >
                       Copy YAML

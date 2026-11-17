@@ -72,7 +72,7 @@ func TestCapacityRecsBucketSQL_AndHistory(t *testing.T) {
 	to := time.Now()
 	from := to.Add(-24 * time.Hour)
 	recs := CapacityRecsBucketSQL("ns", "", from, to)
-	for _, want := range []string{"quantileExact(0.95)", "cpu_p50", MetricContainerCPUUsage, MetricKubePodResourceRequests} {
+	for _, want := range []string{"quantileExactInclusive(0.95)", "cpu_p50", "cpu_p90", "mem_p50", "mem_p90", MetricContainerCPUUsage, MetricKubePodResourceRequests} {
 		if !strings.Contains(recs, want) {
 			t.Errorf("recs SQL missing %q", want)
 		}

@@ -488,10 +488,13 @@ SELECT
   pod,
   container,
   k8s_cluster_name,
-  quantileExact(0.50)(cpu_rate) AS cpu_p50,
-  quantileExact(0.95)(cpu_rate) AS cpu_p95,
+  quantileExactInclusive(0.50)(cpu_rate) AS cpu_p50,
+  quantileExactInclusive(0.90)(cpu_rate) AS cpu_p90,
+  quantileExactInclusive(0.95)(cpu_rate) AS cpu_p95,
   max(cpu_rate) AS cpu_max,
-  quantileExact(0.95)(mem_val) AS mem_p95,
+  quantileExactInclusive(0.50)(mem_val) AS mem_p50,
+  quantileExactInclusive(0.90)(mem_val) AS mem_p90,
+  quantileExactInclusive(0.95)(mem_val) AS mem_p95,
   max(mem_max) AS mem_max,
   max(thr_rate) AS thr_rate,
   argMaxIf(req_cpu, bucket, has_req_cpu) AS req_cpu,
@@ -1053,8 +1056,11 @@ type CapacityRecRow struct {
 	Container string
 	Cluster   string
 	CPUP50    float64
+	CPUP90    float64
 	CPUP95    float64
 	CPUMax    float64
+	MemP50    float64
+	MemP90    float64
 	MemP95    float64
 	MemMax    float64
 	Throttled float64
@@ -1079,8 +1085,11 @@ func ParseCapacityRecRows(rows []map[string]any) []CapacityRecRow {
 			Container: ctr,
 			Cluster:   ParseString(r["k8s_cluster_name"]),
 			CPUP50:    ParseFloat(r["cpu_p50"]),
+			CPUP90:    ParseFloat(r["cpu_p90"]),
 			CPUP95:    ParseFloat(r["cpu_p95"]),
 			CPUMax:    ParseFloat(r["cpu_max"]),
+			MemP50:    ParseFloat(r["mem_p50"]),
+			MemP90:    ParseFloat(r["mem_p90"]),
 			MemP95:    ParseFloat(r["mem_p95"]),
 			MemMax:    ParseFloat(r["mem_max"]),
 			Throttled: ParseFloat(r["thr_rate"]),

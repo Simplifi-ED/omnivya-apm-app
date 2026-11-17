@@ -128,6 +128,17 @@ export interface WorkloadResources {
   memLim: number;
 }
 
+export interface ResourceBounds {
+  lower: number;
+  target: number;
+  upper: number;
+}
+
+export interface WorkloadBounds {
+  cpu?: ResourceBounds;
+  mem?: ResourceBounds;
+}
+
 export interface WorkloadRecommendation {
   namespace: string;
   environment?: string;
@@ -139,17 +150,23 @@ export interface WorkloadRecommendation {
   current: WorkloadResources;
   observed: {
     cpuP50: number;
+    cpuP90: number;
     cpuP95: number;
     cpuMax: number;
+    memP50: number;
+    memP90: number;
     memP95: number;
     memMax: number;
     throttledRate: number;
   };
+  bounds: WorkloadBounds;
   burstable: WorkloadResources;
   guaranteed: WorkloadResources;
   reclaimableMonthlyUsd: number;
   deficitMonthlyUsd: number;
   yamlPatch: string;
+  yamlPatchGuaranteed: string;
+  notes?: string[];
   qosClass: string;
 }
 

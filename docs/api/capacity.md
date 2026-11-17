@@ -2,8 +2,10 @@
 
 Kubernetes resource efficiency, right-sizing recommendations, history, and
 forecasts. All calculations use standard cAdvisor and kube-state-metrics series.
-Goldilocks-compatible right-sizing recommendations are computed in-plugin from
-the same series; no Goldilocks or VPA agents are required in the cluster.
+Right-sizing recommendations use in-plugin VPA-style lower/target/upper bounds
+(p50 / p90 / p95 + 15% margin, with confidence widening on the upper bound and a
+peak floor on limits). Goldilocks QoS mapping applies: Burstable = lower/upper,
+Guaranteed = target/target. No Goldilocks or VPA agents are required.
 
 Experimental.
 
@@ -11,13 +13,13 @@ Base: `{GRAFANA_URL}/api/plugins/omnivya-apm-app/resources`.
 
 ## Endpoints
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| GET | `/capacity` | Fleet waste, gaps, efficiency, population bands, nodes, estimated USD |
-| GET | `/capacity/recommendations` | Burstable / Guaranteed QoS recommendations + YAML patch |
-| GET | `/capacity/history` | Usage / request / limit / throttle / restart range series (Predict drawer) |
-| GET | `/capacity/forecast` | Predict CPU or memory (labeled `linear projection`) |
-| GET | `/namespaces/{namespace}/capacity` | Namespace-scoped overview |
+| Method | Path                               | Purpose                                                                    |
+| ------ | ---------------------------------- | -------------------------------------------------------------------------- |
+| GET    | `/capacity`                        | Fleet waste, gaps, efficiency, population bands, nodes, estimated USD      |
+| GET    | `/capacity/recommendations`        | Burstable / Guaranteed QoS recommendations + YAML patch                    |
+| GET    | `/capacity/history`                | Usage / request / limit / throttle / restart range series (Predict drawer) |
+| GET    | `/capacity/forecast`               | Predict CPU or memory (labeled `linear projection`)                        |
+| GET    | `/namespaces/{namespace}/capacity` | Namespace-scoped overview                                                  |
 
 Shared query params: `environment`, `from`, `to`, optional `namespace`.
 
@@ -49,10 +51,10 @@ Same Jobs-style resolve order:
 
 Path B needs **both** families in ClickHouse:
 
-| Family | MetricNames | Table |
-| --- | --- | --- |
-| Usage (cAdvisor / kubelet) | `container_cpu_usage_seconds_total`, `container_memory_working_set_bytes` (optional throttle/restarts) | sum / gauge |
-| KSM | `kube_pod_container_resource_requests`, `_limits`, optional `kube_pod_owner`, `kube_node_status_allocatable` | gauge |
+| Family                     | MetricNames                                                                                                  | Table       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------- |
+| Usage (cAdvisor / kubelet) | `container_cpu_usage_seconds_total`, `container_memory_working_set_bytes` (optional throttle/restarts)       | sum / gauge |
+| KSM                        | `kube_pod_container_resource_requests`, `_limits`, optional `kube_pod_owner`, `kube_node_status_allocatable` | gauge       |
 
 - Cluster label coalesces `Attributes['k8s_cluster_name']`, `ResourceAttributes['k8s.cluster.name']`, and `ResourceAttributes['cluster']`.
 - Excludes `container=""` and `container="POD"`.
@@ -76,7 +78,10 @@ a gauge read via `argMax`.
 
 ### Path B recommendations
 
-Window percentiles approximate Path A `quantile_over_time(rate(...))` via 5m buckets in ClickHouse (`quantileExact` over per-bucket reset-aware rates). Same Goldilocks burstable/guaranteed math and YAML patch as Path A.
+Window percentiles approximate Path A `quantile_over_time(rate(...))` via 5m
+buckets in ClickHouse (`quantileExactInclusive` over per-bucket reset-aware
+rates for p50/p90/p95). Same bounds math and YAML patches as Path A
+(`yamlPatch` Burstable, `yamlPatchGuaranteed` Guaranteed).
 
 ### Path B history / forecast
 
