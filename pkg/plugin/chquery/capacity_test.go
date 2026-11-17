@@ -185,11 +185,17 @@ func TestCapacityHistorySeriesSQL_ReadsPrecedingSample(t *testing.T) {
 	if !strings.Contains(hist, inRange) {
 		t.Errorf("history must attribute increases only at or after from (%s)", inRange)
 	}
-	if !strings.Contains(hist, "sumIf(dt, MetricName") {
-		t.Errorf("history rates must divide by elapsed sample time\n%s", hist)
+	if !strings.Contains(hist, "sumIf(dt, in_range = 1)") {
+		t.Errorf("history rates must use in-range elapsed sample time\n%s", hist)
 	}
 	if !strings.Contains(hist, "sum(in_range) > 0") {
 		t.Error("history must drop buckets holding only the preceding baseline sample")
+	}
+	if !strings.Contains(hist, "sumIf(inc, in_range = 1)") || !strings.Contains(hist, "sumIf(dt, in_range = 1)") {
+		t.Error("history must exclude preceding samples from inc/dt aggregates")
+	}
+	if !strings.Contains(hist, "sumIf(greatest(inc, 0) / if(dt > 0, dt,") {
+		t.Error("history must rate each container then sum, not divide pooled increments")
 	}
 	if strings.Contains(hist, "max(Value) - min(Value)") {
 		t.Error("history must not derive counter increases from extrema")

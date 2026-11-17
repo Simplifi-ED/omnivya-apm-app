@@ -1529,10 +1529,10 @@ func collectCapacityObservations(resultMap map[string][]queries.PromResult, env 
 				}
 				entry = &capacityObsRec{
 					rec: &WorkloadRecommendation{
-						Namespace: ns,
+						Namespace:   ns,
 						Environment: envName,
-						Container: c,
-						Replicas:  1,
+						Container:   c,
+						Replicas:    1,
 					},
 				}
 				obs[k] = entry
@@ -1632,8 +1632,13 @@ func mergeCapacityByWorkload(
 		if agg.rec.Current.MemLim == 0 && rec.Current.MemLim > 0 {
 			agg.rec.Current.MemLim = rec.Current.MemLim
 		}
-		if agg.rec.Current.CPULim == nil && rec.Current.CPULim != nil {
-			agg.rec.Current.CPULim = rec.Current.CPULim
+		// Keep the highest replica CPU limit so applyThrottleGuard is order-stable
+		// and a throttled pod's limit is never dropped for a lower sibling.
+		if rec.Current.CPULim != nil {
+			if agg.rec.Current.CPULim == nil || *rec.Current.CPULim > *agg.rec.Current.CPULim {
+				lim := *rec.Current.CPULim
+				agg.rec.Current.CPULim = &lim
+			}
 		}
 	}
 	return byWorkload
@@ -1696,19 +1701,19 @@ func finalizeCapacityRecommendation(agg *capacityWkAgg, window time.Duration, cp
 	}
 	wasteCPU := clampMin0(rec.Current.CPUReq - rec.Observed.CPUP95)
 	wasteMem := clampMin0(rec.Current.MemReq - rec.Observed.MemP95)
-	if !agg.cpuSeen.any() {
+	if !agg.cpuSeen.p95 {
 		wasteCPU = 0
 	}
-	if !agg.memSeen.any() {
+	if !agg.memSeen.p95 {
 		wasteMem = 0
 	}
 	rec.ReclaimableMonthlyUSD = roundTo(monthlyUSD(wasteCPU*reps, wasteMem*reps, cpuHour, memHour), 2)
 	defCPU := clampMin0(rec.Observed.CPUP95 - rec.Current.CPUReq)
 	defMem := clampMin0(rec.Observed.MemP95 - rec.Current.MemReq)
-	if !agg.cpuSeen.any() {
+	if !agg.cpuSeen.p95 {
 		defCPU = 0
 	}
-	if !agg.memSeen.any() {
+	if !agg.memSeen.p95 {
 		defMem = 0
 	}
 	rec.DeficitMonthlyUSD = roundTo(monthlyUSD(defCPU*reps, defMem*reps, cpuHour, memHour), 2)

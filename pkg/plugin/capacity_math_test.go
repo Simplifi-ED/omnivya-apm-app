@@ -297,7 +297,7 @@ func TestCapacityResourceBoundsFlat(t *testing.T) {
 func TestCapacityResourceBoundsOrdering(t *testing.T) {
 	t.Parallel()
 	rng := rand.New(rand.NewSource(7))
-	for i := 0; i < 5000; i++ {
+	for range 5000 {
 		days := 1 + rng.Float64()*29
 		lowerMult, upperMult := capacityConfidenceMultipliers(days)
 		q := monotoneQuantiles(
@@ -641,6 +641,45 @@ func TestRecommendationsDroppedWhenQuantilesIncomplete(t *testing.T) {
 	}
 	if len(rec.Notes) == 0 {
 		t.Fatal("a dropped resource must disclose why")
+	}
+	// Missing mem p95 must not treat default 0 as observed usage for USD figures.
+	if rec.Observed.MemP95 != 0 {
+		t.Fatalf("mem p95 must stay zero when the series was absent: %v", rec.Observed.MemP95)
+	}
+}
+
+func TestMergeCapacityByWorkloadKeepsMaxCPULim(t *testing.T) {
+	t.Parallel()
+	low, high := 0.5, 2.0
+	obs := map[capacityPodID]*capacityObsRec{
+		{ns: "demo", pod: "a", container: "web", cluster: "prod"}: {
+			rec: &WorkloadRecommendation{
+				Namespace: "demo", Container: "web", Environment: "prod", Replicas: 1,
+				Observed: WorkloadObserved{ThrottledRate: 0.01},
+				Current:  WorkloadResources{CPULim: &low},
+			},
+			cpuSeen: capacityQuantilesSeen{p95: true},
+		},
+		{ns: "demo", pod: "b", container: "web", cluster: "prod"}: {
+			rec: &WorkloadRecommendation{
+				Namespace: "demo", Container: "web", Environment: "prod", Replicas: 1,
+				Observed: WorkloadObserved{ThrottledRate: 0},
+				Current:  WorkloadResources{CPULim: &high},
+			},
+			cpuSeen: capacityQuantilesSeen{p95: true},
+		},
+	}
+	owners := map[string]struct{ kind, name string }{
+		"demo\x00prod\x00a": {kind: "Deployment", name: "web"},
+		"demo\x00prod\x00b": {kind: "Deployment", name: "web"},
+	}
+	merged := mergeCapacityByWorkload(obs, owners)
+	agg := merged[capacityWkKey{ns: "demo", kind: "Deployment", name: "web", container: "web", cluster: "prod"}]
+	if agg == nil || agg.rec.Current.CPULim == nil || *agg.rec.Current.CPULim != high {
+		t.Fatalf("merged CPULim must be the max replica limit: %+v", agg)
+	}
+	if agg.rec.Observed.ThrottledRate != 0.01 {
+		t.Fatalf("throttle must survive with the max limit: %+v", agg.rec.Observed)
 	}
 }
 

@@ -223,16 +223,26 @@ func capacityResetAwareIncrease(prev, cur float64, hasPrev bool) float64 {
 	return cur
 }
 
-// capacityCounterRateSQL is a reset-aware counter rate. It divides by the
-// elapsed sample seconds actually covered, so a sparse bucket still yields a
-// real rate, and falls back to the bucket width when no sample had a
-// predecessor. Both sums scope to one metric so the gauge rows sharing the
-// group cannot dilute the elapsed divisor.
+// capacityCounterRateSQL is a reset-aware counter rate for a single series
+// group. It divides by the elapsed sample seconds actually covered, so a sparse
+// bucket still yields a real rate, and falls back to the bucket width when no
+// sample had a predecessor. Both sums scope to one metric so the gauge rows
+// sharing the group cannot dilute the elapsed divisor.
 func capacityCounterRateSQL(metric string, fallbackSec int) string {
 	sumDt := fmt.Sprintf("sumIf(dt, MetricName = %s)", metric)
 	return fmt.Sprintf(
 		"greatest(sumIf(inc, MetricName = %s), 0) / if(%s > 0, %s, %d)",
 		metric, sumDt, sumDt, fallbackSec,
+	)
+}
+
+// capacityCounterRateSumSQL rates each pre-aggregated series row, then sums.
+// Use this when folding many containers into one namespace/fleet total: summing
+// increments and dividing once under-weights short/dense series.
+func capacityCounterRateSumSQL(metric string, fallbackSec int) string {
+	return fmt.Sprintf(
+		"sumIf(greatest(inc, 0) / if(dt > 0, dt, %d), MetricName = %s)",
+		fallbackSec, metric,
 	)
 }
 
@@ -260,7 +270,7 @@ SELECT
   pod,
   container,
   k8s_cluster_name,
-  nullIf(any(node), '') AS node,
+  nullIf(anyIf(node, node != ''), '') AS node,
   greatest(sumIf(inc, MetricName = %s), 0) / %g AS usage_cpu,
   argMaxIf(Value, TimeUnix, MetricName = %s) AS usage_mem,
   argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS req_cpu,
@@ -641,8 +651,8 @@ FROM (
     pod,
     container,
     k8s_cluster_name,
-    sum(inc) AS inc,
-    sum(dt) AS dt,
+    sumIf(inc, in_range = 1) AS inc,
+    sumIf(dt, in_range = 1) AS dt,
     argMax(Value, TimeUnix) AS latest
   FROM (
     SELECT
@@ -693,13 +703,13 @@ FROM (
 GROUP BY bucket_ms
 ORDER BY bucket_ms
 LIMIT 5000`,
-		capacityCounterRateSQL(q(MetricContainerCPUUsage), stepSec),
+		capacityCounterRateSumSQL(q(MetricContainerCPUUsage), stepSec),
 		q(MetricKubePodResourceRequests),
 		q(MetricKubePodResourceLimits),
 		q(MetricContainerMemoryWorkingSet),
 		q(MetricKubePodResourceRequests),
 		q(MetricKubePodResourceLimits),
-		capacityCounterRateSQL(q(MetricContainerCPUThrottled), stepSec),
+		capacityCounterRateSumSQL(q(MetricContainerCPUThrottled), stepSec),
 		q(MetricKubePodRestarts),
 		stepSec,
 		capacityCounterLagSQL(),
