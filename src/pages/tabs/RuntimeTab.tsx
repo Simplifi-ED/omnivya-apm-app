@@ -1,7 +1,8 @@
-import React from 'react';
-import { useStyles2, useTheme2, Alert, Icon, Badge } from '@grafana/ui';
+import React, { useMemo } from 'react';
+import { useStyles2, useTheme2, Alert, Icon, Badge, LinkButton } from '@grafana/ui';
 import { GrafanaTheme2 } from '@grafana/data';
 import { css } from '@emotion/css';
+import { useSearchParams } from 'react-router-dom';
 import {
   getRuntimeMetrics,
   RuntimeResponse,
@@ -14,6 +15,7 @@ import {
   MemoryPool,
 } from '../../api/client';
 import { useFetch } from '../../utils/useFetch';
+import { PLUGIN_BASE_URL } from '../../constants';
 import { typographyFontSize } from '../../utils/themeTypography';
 import { CardGridSkeleton } from '../../components/Skeleton';
 
@@ -57,7 +59,7 @@ export function RuntimeTab({ service, namespace, environment, fromMs, toMs }: Ru
 
   return (
     <div className={styles.container}>
-      {data?.container && <ContainerCard container={data.container} />}
+      {data?.container && <ContainerCard container={data.container} namespace={namespace} environment={environment} />}
       {data?.jvm && <JVMCard jvm={data.jvm} />}
       {data?.nodejs && <NodeJSCard nodejs={data.nodejs} />}
       {data?.go && <GoCard goRt={data.go} />}
@@ -429,8 +431,38 @@ function KafkaCard({ kafka }: { kafka: KafkaRuntime }) {
 // Container Resources Card
 // ---------------------------------------------------------------------------
 
-function ContainerCard({ container }: { container: ContainerRuntime }) {
+function ContainerCard({
+  container,
+  namespace,
+  environment,
+}: {
+  container: ContainerRuntime;
+  namespace: string;
+  environment?: string;
+}) {
   const styles = useStyles2(getStyles);
+  const [searchParams] = useSearchParams();
+  const capacityHref = useMemo(() => {
+    const params = new URLSearchParams();
+    for (const key of ['from', 'to']) {
+      const v = searchParams.get(key);
+      if (v) {
+        params.set(key, v);
+      }
+    }
+    params.set('namespace', namespace);
+    params.set('histNs', namespace);
+    params.set('capTab', 'rightsizing');
+    if (environment) {
+      params.set('environment', environment);
+    } else {
+      const env = searchParams.get('environment');
+      if (env) {
+        params.set('environment', env);
+      }
+    }
+    return `${PLUGIN_BASE_URL}/capacity?${params.toString()}`;
+  }, [searchParams, namespace, environment]);
 
   const cpuPctReq = container.cpuRequests > 0 ? (container.cpuUsage / container.cpuRequests) * 100 : 0;
   const cpuPctLim = container.cpuLimits > 0 ? (container.cpuUsage / container.cpuLimits) * 100 : 0;
@@ -452,6 +484,9 @@ function ContainerCard({ container }: { container: ContainerRuntime }) {
             color="red"
           />
         )}
+        <LinkButton href={capacityHref} fill="text" size="sm" className={styles.capacityLink}>
+          Capacity →
+        </LinkButton>
       </div>
 
       <div className={styles.metricsGrid}>
@@ -835,6 +870,18 @@ const getStyles = (theme: GrafanaTheme2) => ({
     font-weight: ${theme.typography.fontWeightMedium};
     margin-bottom: ${theme.spacing(2)};
     color: ${theme.colors.text.primary};
+  `,
+  capacityLink: css`
+    margin-left: auto;
+    background: none;
+    border: none;
+    color: ${theme.colors.text.link};
+    cursor: pointer;
+    font-size: ${typographyFontSize(theme, 'sm')};
+    padding: 0;
+    &:hover {
+      text-decoration: underline;
+    }
   `,
   metricsGrid: css`
     display: grid;

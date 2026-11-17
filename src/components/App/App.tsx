@@ -8,6 +8,7 @@ import { ErrorBoundary } from '../ErrorBoundary';
 
 const ServiceInventory = React.lazy(() => import('../../pages/ServiceInventory'));
 const JobsInventory = React.lazy(() => import('../../pages/JobsInventory'));
+const Capacity = React.lazy(() => import('../../pages/Capacity'));
 const ServiceOverview = React.lazy(() => import('../../pages/ServiceOverview'));
 const NamespaceOverview = React.lazy(() => import('../../pages/NamespaceOverview'));
 const StatusBoard = React.lazy(() => import('../../pages/StatusBoard'));
@@ -172,6 +173,14 @@ function App(props: AppRootProps) {
             element={
               <ErrorBoundary label="Jobs inventory">
                 <JobsInventory />
+              </ErrorBoundary>
+            }
+          />
+          <Route
+            path={ROUTES.Capacity}
+            element={
+              <ErrorBoundary label="Capacity">
+                <Capacity />
               </ErrorBoundary>
             }
           />

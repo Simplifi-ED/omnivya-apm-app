@@ -266,15 +266,19 @@ type KafkaMetrics struct {
 
 // ContainerMetrics defines metric names for Kubernetes container resource metrics.
 type ContainerMetrics struct {
-	CPUUsage        string // container_cpu_usage_seconds_total — counter
-	CPUThrottled    string // container_cpu_cfs_throttled_seconds_total — counter
-	MemoryUsage     string // container_memory_usage_bytes — gauge
-	ResourceReqs    string // kube_pod_container_resource_requests — gauge (resource label)
-	ResourceLimits  string // kube_pod_container_resource_limits — gauge (resource label)
-	Restarts        string // kube_pod_container_status_restarts_total — counter
-	DesiredReplicas string // kube_deployment_spec_replicas — gauge
-	ContainerLabel  string // "container"
-	ResourceLabel   string // "resource"
+	CPUUsage         string // container_cpu_usage_seconds_total — counter
+	CPUThrottled     string // container_cpu_cfs_throttled_seconds_total — counter
+	MemoryUsage      string // container_memory_usage_bytes — gauge (includes page cache)
+	MemoryWorkingSet string // container_memory_working_set_bytes — gauge (OOM-relevant)
+	ResourceReqs     string // kube_pod_container_resource_requests — gauge (resource label)
+	ResourceLimits   string // kube_pod_container_resource_limits — gauge (resource label)
+	Restarts         string // kube_pod_container_status_restarts_total — counter
+	DesiredReplicas  string // kube_deployment_spec_replicas — gauge
+	NodeAllocatable  string // kube_node_status_allocatable — gauge (resource label)
+	PodOwner         string // kube_pod_owner — gauge
+	ReplicaSetOwner  string // kube_replicaset_owner — gauge
+	ContainerLabel   string // "container"
+	ResourceLabel    string // "resource"
 }
 
 // GoMetrics defines metric names for Go runtime observability.
@@ -535,15 +539,19 @@ func Default() Config {
 				Info:       "go_info",
 			},
 			Container: ContainerMetrics{
-				CPUUsage:        "container_cpu_usage_seconds_total",
-				CPUThrottled:    "container_cpu_cfs_throttled_seconds_total",
-				MemoryUsage:     "container_memory_usage_bytes",
-				ResourceReqs:    "kube_pod_container_resource_requests",
-				ResourceLimits:  "kube_pod_container_resource_limits",
-				Restarts:        "kube_pod_container_status_restarts_total",
-				DesiredReplicas: "kube_deployment_spec_replicas",
-				ContainerLabel:  "container",
-				ResourceLabel:   "resource",
+				CPUUsage:         "container_cpu_usage_seconds_total",
+				CPUThrottled:     "container_cpu_cfs_throttled_seconds_total",
+				MemoryUsage:      "container_memory_usage_bytes",
+				MemoryWorkingSet: "container_memory_working_set_bytes",
+				ResourceReqs:     "kube_pod_container_resource_requests",
+				ResourceLimits:   "kube_pod_container_resource_limits",
+				Restarts:         "kube_pod_container_status_restarts_total",
+				DesiredReplicas:  "kube_deployment_spec_replicas",
+				NodeAllocatable:  "kube_node_status_allocatable",
+				PodOwner:         "kube_pod_owner",
+				ReplicaSetOwner:  "kube_replicaset_owner",
+				ContainerLabel:   "container",
+				ResourceLabel:    "resource",
 			},
 		},
 	}

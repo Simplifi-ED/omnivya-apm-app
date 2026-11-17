@@ -23,6 +23,7 @@ docs link to.
 | Frontend (Faro)             | [frontend.md](./frontend.md)               | `/frontend`, `/frontend/versions`, `/frontend/sessions`, `/feedback`                                            |
 | Analytics                   | [analytics.md](./analytics.md)             | `/logs/patterns`, `/traces/breakdown`                                                                           |
 | Platform                    | [platform.md](./platform.md)               | `/capabilities`, `/scorecard`, `/jobs`, `/service-map`, `/service-map/clustered`                                |
+| Capacity                    | [capacity.md](./capacity.md)               | `/capacity`, `/capacity/recommendations`, `/capacity/history`, `/capacity/forecast`, `/namespaces/{ns}/capacity` |
 | Alert templates             | [alert-templates.md](./alert-templates.md) | `/alert-templates/{kind}`                                                                                       |
 | Services, health & topology | [services.md](./services.md)               | `/services`, `/health`, `/operations`, `/endpoints`, `/runtime`, plus experimental dependency/graphql endpoints |
 

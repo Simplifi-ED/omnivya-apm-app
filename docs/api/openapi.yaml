@@ -889,6 +889,101 @@ paths:
               schema: { $ref: "#/components/schemas/JobsResponse" }
         "503": { description: Metrics datasource not configured. }
 
+  /capacity:
+    get:
+      tags: [experimental]
+      summary: Fleet Kubernetes resource efficiency (waste, gaps, rate-based savings estimates).
+      parameters:
+        - { $ref: "#/components/parameters/namespaceQuery" }
+        - { $ref: "#/components/parameters/environment" }
+        - { $ref: "#/components/parameters/from" }
+        - { $ref: "#/components/parameters/to" }
+      responses:
+        "200":
+          description: Capacity overview.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CapacityOverview" }
+
+  /capacity/recommendations:
+    get:
+      tags: [experimental]
+      summary: Goldilocks-style workload right-sizing recommendations (no VPA/Goldilocks agent required).
+      parameters:
+        - { $ref: "#/components/parameters/namespaceQuery" }
+        - { $ref: "#/components/parameters/environment" }
+        - { $ref: "#/components/parameters/from" }
+        - { $ref: "#/components/parameters/to" }
+      responses:
+        "200":
+          description: Recommendations.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CapacityRecommendationsResponse" }
+
+  /capacity/history:
+    get:
+      tags: [experimental]
+      summary: Historical usage, request, limit, throttle, and restart series for a namespace or container.
+      parameters:
+        - { $ref: "#/components/parameters/namespaceQuery" }
+        - { $ref: "#/components/parameters/environment" }
+        - { $ref: "#/components/parameters/from" }
+        - { $ref: "#/components/parameters/to" }
+        - name: workload
+          in: query
+          schema: { type: string }
+        - name: container
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: History series.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CapacityHistoryResponse" }
+
+  /capacity/forecast:
+    get:
+      tags: [experimental]
+      summary: CPU or memory forecast via in-plugin linear projection over Capacity history.
+      parameters:
+        - { $ref: "#/components/parameters/namespaceQuery" }
+        - { $ref: "#/components/parameters/environment" }
+        - { $ref: "#/components/parameters/from" }
+        - { $ref: "#/components/parameters/to" }
+        - name: resource
+          in: query
+          schema: { type: string, enum: [cpu, memory], default: cpu }
+        - name: workload
+          in: query
+          schema: { type: string }
+        - name: container
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Forecast.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CapacityForecastResponse" }
+
+  /namespaces/{namespace}/capacity:
+    get:
+      tags: [experimental]
+      summary: Capacity overview scoped to one namespace.
+      parameters:
+        - { $ref: "#/components/parameters/namespacePath" }
+        - { $ref: "#/components/parameters/environment" }
+        - { $ref: "#/components/parameters/from" }
+        - { $ref: "#/components/parameters/to" }
+      responses:
+        "200":
+          description: Namespace capacity.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CapacityOverview" }
+
   /service-map:
     get:
       tags: [experimental]
@@ -1763,6 +1858,43 @@ components:
               status: { type: string }
               runCount: { type: integer }
         note: { type: string }
+    CapacityOverview:
+      type: object
+      properties:
+        available: { type: boolean }
+        enablementNote: { type: string }
+        efficiency: { type: object }
+        population: { type: object, description: "Efficiency under/ok/over bands for clusters, nodes, namespaces" }
+        gapCounts: { type: object }
+        namespaces: { type: array, items: { type: object } }
+        nodes: { type: array, items: { type: object }, description: "Per-node usage vs allocatable; storage optional" }
+        topWasteCpu: { type: array, items: { type: object } }
+        topWasteMem: { type: array, items: { type: object } }
+        topRiskContainers: { type: array, items: { type: object } }
+    CapacityRecommendationsResponse:
+      type: object
+      properties:
+        available: { type: boolean }
+        enablementNote: { type: string }
+        recommendations: { type: array, items: { type: object } }
+    CapacityHistoryResponse:
+      type: object
+      properties:
+        available: { type: boolean }
+        enablementNote: { type: string }
+        series: { type: array, items: { type: object } }
+        note: { type: string }
+    CapacityForecastResponse:
+      type: object
+      properties:
+        available: { type: boolean }
+        enablementNote: { type: string }
+        method: { type: string }
+        methodLabel: { type: string }
+        resource: { type: string }
+        series: { type: array, items: { type: object } }
+        daysToRequest: { type: number }
+        daysToLimit: { type: number }
     ServiceMapResponse:
       type: object
       properties:

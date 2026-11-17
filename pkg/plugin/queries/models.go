@@ -121,6 +121,17 @@ type PluginSettings struct {
 	// KnownTeams is an optional allow-list for owner.team values (docs/ownership.md).
 	// Empty = free text. When set, unknown teams still display but teamKnown=false.
 	KnownTeams []string `json:"knownTeams,omitempty"`
+
+	// CapacityCostRates overrides the on-demand unit rates used for Capacity
+	// reclaimable/deficit USD estimates. Zero values keep the built-in defaults
+	// ($0.0316/vCPU-hr, $0.0042/GiB-hr).
+	CapacityCostRates CapacityCostRates `json:"capacityCostRates"`
+}
+
+// CapacityCostRates are hourly on-demand unit prices for Capacity savings estimates.
+type CapacityCostRates struct {
+	CPUHourUSD    float64 `json:"cpuHourUsd,omitempty"`
+	MemoryGiBHour float64 `json:"memoryGibHourUsd,omitempty"`
 }
 
 // Capabilities represents the detected OTel data capabilities.

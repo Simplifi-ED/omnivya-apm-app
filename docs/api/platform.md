@@ -12,6 +12,7 @@ Contents:
 - [`GET /capabilities`](#get-capabilities) — stable
 - [`GET /scorecard`](#get-scorecard)
 - [`GET /jobs`](#get-jobs)
+- Capacity endpoints — see [capacity.md](./capacity.md)
 - [`GET /service-map`](#get-service-map)
 - [`GET /service-map/clustered`](#get-service-mapclustered)
 

@@ -1,7 +1,7 @@
 import React, { useMemo } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { PluginPage } from '@grafana/runtime';
-import { Alert, Badge, FilterPill, Icon, Input, MultiCombobox, Tooltip, useStyles2 } from '@grafana/ui';
+import { Alert, Badge, FilterPill, Icon, InlineField, Input, MultiCombobox, Tooltip, useStyles2 } from '@grafana/ui';
 import { GrafanaTheme2, dateTime } from '@grafana/data';
 import { css } from '@emotion/css';
 import { getJobs, JobEntry } from '../api/jobs';
@@ -296,23 +296,27 @@ function JobsInventory() {
               <div className={styles.scopeRow}>
                 <div className={styles.filterGroup}>
                   <div className={styles.filterItem}>
-                    <Input
-                      aria-label="Filter jobs"
-                      prefix={<Icon name="search" />}
-                      placeholder="Filter jobs..."
-                      value={search}
-                      onChange={(e) => updateParams({ q: e.currentTarget.value || null })}
-                    />
+                    <InlineField label="Filter" grow noMargin>
+                      <Input
+                        aria-label="Filter jobs"
+                        prefix={<Icon name="search" />}
+                        placeholder="Filter jobs..."
+                        value={search}
+                        onChange={(e) => updateParams({ q: e.currentTarget.value || null })}
+                      />
+                    </InlineField>
                   </div>
                   <div className={styles.filterItem}>
-                    <MultiCombobox
-                      options={namespaceOptions}
-                      value={nsFilters}
-                      onChange={(selected) =>
-                        updateParams({ namespace: selected.length ? selected.map((o) => o.value).join(',') : null })
-                      }
-                      placeholder="All namespaces"
-                    />
+                    <InlineField label="Namespace" grow noMargin>
+                      <MultiCombobox
+                        options={namespaceOptions}
+                        value={nsFilters}
+                        onChange={(selected) =>
+                          updateParams({ namespace: selected.length ? selected.map((o) => o.value).join(',') : null })
+                        }
+                        placeholder="All namespaces"
+                      />
+                    </InlineField>
                   </div>
                 </div>
                 <HeaderTimeControls onRefresh={handleRefresh} />

@@ -29,9 +29,10 @@ bookmarks, alert `dashboard_url` annotations, and shared links to
 ```
 /a/omnivya-apm-app/service-map                               global service map (#22)
 /a/omnivya-apm-app/jobs                                      cron / Naisjob inventory (#74)
+/a/omnivya-apm-app/capacity                                  resource efficiency & right-sizing
 ```
 
-Both fleet pages read the global `from`/`to` and `environment` params (below) and
+Fleet pages read the global `from`/`to` and `environment` params (below) and
 carry their own view/filter params (see "Page-scoped query parameters").
 
 ## Shared query parameters
@@ -63,6 +64,16 @@ and follow the same stability promise as the shared params above.
 | `status`    | `failing`                                                                              | When set, shows only failing jobs (the only recognized value). |
 | `sort`      | `name` \| `namespace` \| `cluster` \| `schedule` \| `lastRun` \| `nextRun` \| `streak` | Sort column (default `name`).                                  |
 | `dir`       | `asc` \| `desc`                                                                        | Sort direction (default `asc`).                                |
+
+### Capacity (`/capacity`)
+
+| Param         | Values                                                         | Meaning                                              |
+| ------------- | -------------------------------------------------------------- | ---------------------------------------------------- |
+| `namespace`   | namespace name                                                 | Optional fleet filter (Combobox).                    |
+| `environment` | cluster name                                                   | Same as shared `environment` (Combobox).             |
+| `capTab`      | `overview` \| `namespaces` \| `nodes` \| `rightsizing`         | Active Capacity tab (`overview` when omitted).       |
+
+Predict opens as a drawer from a namespace/node row (Combobox scope). History/Forecast tabs and `histNs` are removed.
 
 ### Issues tab facets (`tab=issues`)
 

@@ -1,0 +1,1208 @@
+package chquery
+
+import (
+	"fmt"
+	"math"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/nais/grafana-otel-plugin/pkg/plugin/queries"
+)
+
+// Capacity Path B metric names (Prom-style via prometheus receiver → otel_metrics_*).
+// Same families as Path A otelconfig ContainerMetrics. process_* is never usage.
+const (
+	MetricContainerCPUUsage         = "container_cpu_usage_seconds_total"
+	MetricContainerMemoryWorkingSet = "container_memory_working_set_bytes"
+	MetricContainerCPUThrottled     = "container_cpu_cfs_throttled_seconds_total"
+	MetricContainerFSUsage          = "container_fs_usage_bytes"
+	MetricContainerFSLimit          = "container_fs_limit_bytes"
+	MetricKubePodResourceRequests   = "kube_pod_container_resource_requests"
+	MetricKubePodResourceLimits     = "kube_pod_container_resource_limits"
+	MetricKubeNodeAllocatable       = "kube_node_status_allocatable"
+	MetricKubePodOwner              = "kube_pod_owner"
+	MetricKubePodRestarts           = "kube_pod_container_status_restarts_total"
+
+	// CapacityUsageLookbackSec matches Path A capacityLookback ("5m").
+	CapacityUsageLookbackSec = 300
+)
+
+// CapacityContainerIdentity is one (namespace, pod, container) ledger row.
+type CapacityContainerIdentity struct {
+	Namespace   string
+	Pod         string
+	Container   string
+	Cluster     string
+	Node        string
+	UsageCPU    float64 // cores (rate over lookback)
+	UsageMem    float64 // bytes
+	ReqCPU      float64
+	ReqMem      float64
+	LimCPU      float64
+	LimMem      float64
+	Throttled   float64 // seconds/sec over lookback
+	HasUsageCPU bool
+	HasUsageMem bool
+	HasReqCPU   bool
+	HasReqMem   bool
+	HasLimCPU   bool
+	HasLimMem   bool
+	HasThrottle bool
+}
+
+func capacityNodeExpr() string {
+	return `coalesce(
+    nullIf(Attributes['node'], ''),
+    nullIf(Attributes['kubernetes_io_hostname'], ''),
+    nullIf(ResourceAttributes['k8s.node.name'], ''),
+    nullIf(ResourceAttributes['host.name'], ''),
+    ''
+  )`
+}
+
+func capacityClusterExpr() string {
+	return `coalesce(
+    nullIf(Attributes['k8s_cluster_name'], ''),
+    nullIf(ResourceAttributes['k8s.cluster.name'], ''),
+    nullIf(ResourceAttributes['cluster'], ''),
+    ''
+  )`
+}
+
+func capacityNamespaceExpr() string {
+	return `coalesce(
+    nullIf(Attributes['namespace'], ''),
+    nullIf(Attributes['exported_namespace'], ''),
+    nullIf(ResourceAttributes['k8s.namespace.name'], ''),
+    ''
+  )`
+}
+
+func capacityPodExpr() string {
+	return `coalesce(
+    nullIf(Attributes['pod'], ''),
+    nullIf(ResourceAttributes['k8s.pod.name'], ''),
+    ''
+  )`
+}
+
+func capacityContainerExpr() string {
+	return `coalesce(
+    nullIf(Attributes['container'], ''),
+    nullIf(ResourceAttributes['k8s.container.name'], ''),
+    ''
+  )`
+}
+
+func capacityNamespaceFilter(namespace string) string {
+	if namespace == "" {
+		return "1"
+	}
+	return fmt.Sprintf("(%s = %s)", capacityNamespaceExpr(), q(namespace))
+}
+
+func capacityEnvFilter(env string) string {
+	if env == "" {
+		return "1"
+	}
+	envs := strings.Split(env, ",")
+	quoted := make([]string, 0, len(envs))
+	for _, e := range envs {
+		e = strings.TrimSpace(e)
+		if e != "" {
+			quoted = append(quoted, q(e))
+		}
+	}
+	switch len(quoted) {
+	case 0:
+		return "1"
+	case 1:
+		return fmt.Sprintf("(%s = %s)", capacityClusterExpr(), quoted[0])
+	default:
+		return fmt.Sprintf("(%s IN (%s))", capacityClusterExpr(), strings.Join(quoted, ", "))
+	}
+}
+
+// capacityPodWorkloadFilter scopes pods to a workload name (Deployment RS suffix,
+// StatefulSet ordinal, or exact pod name). Empty workload = no filter.
+func capacityPodWorkloadFilter(workload string) string {
+	if workload == "" {
+		return "1"
+	}
+	pod := capacityPodExpr()
+	return fmt.Sprintf("(%s = %s OR startsWith(%s, %s))", pod, q(workload), pod, q(workload+"-"))
+}
+
+func capacityContainerExclude() string {
+	return fmt.Sprintf(
+		"(%s != '' AND %s != 'POD')",
+		capacityContainerExpr(), capacityContainerExpr(),
+	)
+}
+
+// CapacityUsageProbeSQL is true when any cAdvisor usage series exists.
+// Does not match process_* (forbidden substitute).
+func CapacityUsageProbeSQL(from, to time.Time) string {
+	tf := MetricTimeFilter(from, to)
+	return fmt.Sprintf(`
+SELECT count() AS c FROM (
+  SELECT 1
+  FROM %s
+  WHERE MetricName = %s AND %s
+  LIMIT 1
+  UNION ALL
+  SELECT 1
+  FROM %s
+  WHERE MetricName = %s AND %s
+  LIMIT 1
+)
+LIMIT 1`,
+		table(queries.CHTableMetricsSum), q(MetricContainerCPUUsage), tf,
+		table(queries.CHTableMetricsGauge), q(MetricContainerMemoryWorkingSet), tf,
+	)
+}
+
+// CapacityKSMProbeSQL is true when kube_pod_container_resource_requests exists.
+func CapacityKSMProbeSQL(from, to time.Time) string {
+	return fmt.Sprintf(`
+SELECT count() AS c FROM (
+  SELECT 1
+  FROM %s
+  WHERE MetricName = %s AND %s
+  LIMIT 1
+)
+LIMIT 1`,
+		table(queries.CHTableMetricsGauge),
+		q(MetricKubePodResourceRequests),
+		MetricTimeFilter(from, to),
+	)
+}
+
+// capacityCounterPartition matches the Prom series identity of one
+// cAdvisor/KSM counter inside a Path B metric table.
+const capacityCounterPartition = "namespace, pod, container, k8s_cluster_name, MetricName"
+
+// capacityCounterLagSQL adds the previous sample of a counter series. Out of
+// frame lagInFrame yields 0 for both arguments, which would read as a real
+// previous sample, so the NaN default marks "no previous sample".
+func capacityCounterLagSQL() string {
+	win := fmt.Sprintf(
+		"OVER (PARTITION BY %s ORDER BY TimeUnix ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING)",
+		capacityCounterPartition,
+	)
+	return fmt.Sprintf(
+		"lagInFrame(Value, 1, nan) %s AS prev_val,\n    lagInFrame(TimeUnix) %s AS prev_ts",
+		win, win,
+	)
+}
+
+// capacityCounterIncSQL is the reset-aware increase. Mirrors
+// capacityResetAwareIncrease: a decrease is a counter reset, so the new value
+// is the increase.
+func capacityCounterIncSQL() string {
+	return "if(isNaN(prev_val), 0., if(Value >= prev_val, Value - prev_val, Value)) AS inc"
+}
+
+// capacityCounterDtSQL is the elapsed seconds since the previous sample, which
+// stays 0 when the series has no preceding sample.
+func capacityCounterDtSQL() string {
+	return "if(isNaN(prev_val), 0, dateDiff('second', prev_ts, TimeUnix)) AS dt"
+}
+
+// capacityResetAwareIncrease is the Go twin of capacityCounterIncSQL, kept so
+// the reset rule is testable without a ClickHouse round trip.
+func capacityResetAwareIncrease(prev, cur float64, hasPrev bool) float64 {
+	if !hasPrev {
+		return 0
+	}
+	if cur >= prev {
+		return cur - prev
+	}
+	return cur
+}
+
+// capacityCounterRateSQL is a reset-aware counter rate for a single series
+// group. It divides by the elapsed sample seconds actually covered, so a sparse
+// bucket still yields a real rate, and falls back to the bucket width when no
+// sample had a predecessor. Both sums scope to one metric so the gauge rows
+// sharing the group cannot dilute the elapsed divisor.
+func capacityCounterRateSQL(metric string, fallbackSec int) string {
+	sumDt := fmt.Sprintf("sumIf(dt, MetricName = %s)", metric)
+	return fmt.Sprintf(
+		"greatest(sumIf(inc, MetricName = %s), 0) / if(%s > 0, %s, %d)",
+		metric, sumDt, sumDt, fallbackSec,
+	)
+}
+
+// capacityCounterRateSumSQL rates each pre-aggregated series row, then sums.
+// Use this when folding many containers into one namespace/fleet total: summing
+// increments and dividing once under-weights short/dense series.
+func capacityCounterRateSumSQL(metric string, fallbackSec int) string {
+	return fmt.Sprintf(
+		"sumIf(greatest(inc, 0) / if(dt > 0, dt, %d), MetricName = %s)",
+		fallbackSec, metric,
+	)
+}
+
+// CapacityLedgerSQL returns one row per (namespace, pod, container) with usage,
+// request, limit, and throttle columns over the lookback window ending at `to`.
+// from should be to - CapacityUsageLookbackSec for rate deltas.
+func CapacityLedgerSQL(namespace, env string, from, to time.Time) string {
+	tf := MetricTimeFilter(from, to)
+	nsF := capacityNamespaceFilter(namespace)
+	envF := capacityEnvFilter(env)
+	ctrX := capacityContainerExclude()
+	nsE := capacityNamespaceExpr()
+	podE := capacityPodExpr()
+	ctrE := capacityContainerExpr()
+	clE := capacityClusterExpr()
+	nodeE := capacityNodeExpr()
+	win := float64(CapacityUsageLookbackSec)
+	if d := to.Sub(from).Seconds(); d > 1 {
+		win = d
+	}
+
+	return fmt.Sprintf(`
+SELECT
+  namespace,
+  pod,
+  container,
+  k8s_cluster_name,
+  nullIf(anyIf(node, node != ''), '') AS node,
+  greatest(sumIf(inc, MetricName = %s), 0) / %g AS usage_cpu,
+  argMaxIf(Value, TimeUnix, MetricName = %s) AS usage_mem,
+  argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS req_cpu,
+  argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'memory') AS req_mem,
+  argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS lim_cpu,
+  argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'memory') AS lim_mem,
+  greatest(sumIf(inc, MetricName = %s), 0) / %g AS thr_rate,
+  countIf(MetricName = %s) > 0 AS has_usage_cpu,
+  countIf(MetricName = %s) > 0 AS has_usage_mem,
+  countIf(MetricName = %s AND Attributes['resource'] = 'cpu') > 0 AS has_req_cpu,
+  countIf(MetricName = %s AND Attributes['resource'] = 'memory') > 0 AS has_req_mem,
+  countIf(MetricName = %s AND Attributes['resource'] = 'cpu') > 0 AS has_lim_cpu,
+  countIf(MetricName = %s AND Attributes['resource'] = 'memory') > 0 AS has_lim_mem,
+  countIf(MetricName = %s) > 0 AS has_throttle
+FROM (
+  SELECT
+    namespace,
+    pod,
+    container,
+    k8s_cluster_name,
+    node,
+    MetricName,
+    TimeUnix,
+    Value,
+    Attributes,
+    %s,
+    %s
+  FROM (
+    SELECT
+      %s AS namespace,
+      %s AS pod,
+      %s AS container,
+      %s AS k8s_cluster_name,
+      %s AS node,
+      MetricName,
+      TimeUnix,
+      Value,
+      Attributes
+    FROM %s
+    WHERE MetricName IN (%s, %s)
+      AND %s AND (%s) AND (%s) AND (%s)
+    UNION ALL
+    SELECT
+      %s AS namespace,
+      %s AS pod,
+      %s AS container,
+      %s AS k8s_cluster_name,
+      %s AS node,
+      MetricName,
+      TimeUnix,
+      Value,
+      Attributes
+    FROM %s
+    WHERE MetricName IN (%s, %s, %s)
+      AND %s AND (%s) AND (%s) AND (%s)
+  )
+)
+GROUP BY namespace, pod, container, k8s_cluster_name
+HAVING container != '' AND container != 'POD'`,
+		q(MetricContainerCPUUsage), win,
+		q(MetricContainerMemoryWorkingSet),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceLimits),
+		q(MetricKubePodResourceLimits),
+		q(MetricContainerCPUThrottled), win,
+		q(MetricContainerCPUUsage),
+		q(MetricContainerMemoryWorkingSet),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceLimits),
+		q(MetricKubePodResourceLimits),
+		q(MetricContainerCPUThrottled),
+		capacityCounterLagSQL(),
+		capacityCounterIncSQL(),
+		nsE, podE, ctrE, clE, nodeE,
+		table(queries.CHTableMetricsSum),
+		q(MetricContainerCPUUsage), q(MetricContainerCPUThrottled),
+		tf, nsF, envF, ctrX,
+		nsE, podE, ctrE, clE, nodeE,
+		table(queries.CHTableMetricsGauge),
+		q(MetricContainerMemoryWorkingSet), q(MetricKubePodResourceRequests), q(MetricKubePodResourceLimits),
+		tf, nsF, envF, ctrX,
+	)
+}
+
+// CapacityNodeAllocSQL returns per-node allocatable CPU/memory.
+func CapacityNodeAllocSQL(env string, from, to time.Time) string {
+	return fmt.Sprintf(`
+SELECT
+  node,
+  k8s_cluster_name,
+  sumIf(v, resource = 'cpu') AS alloc_cpu,
+  sumIf(v, resource = 'memory') AS alloc_mem
+FROM (
+  SELECT
+    Attributes['resource'] AS resource,
+    %s AS node,
+    %s AS k8s_cluster_name,
+    argMax(Value, TimeUnix) AS v
+  FROM %s
+  WHERE MetricName = %s
+    AND %s
+    AND (%s)
+  GROUP BY resource, node, k8s_cluster_name
+)
+WHERE node != ''
+GROUP BY node, k8s_cluster_name`,
+		capacityNodeExpr(),
+		capacityClusterExpr(),
+		table(queries.CHTableMetricsGauge),
+		q(MetricKubeNodeAllocatable),
+		MetricTimeFilter(from, to),
+		capacityEnvFilter(env),
+	)
+}
+
+// CapacityNodeFsSQL returns per-node root-cgroup filesystem usage/limit (when scraped).
+// Prefer id="/" (node root); fall back to any empty-container series. Never invent from capacity-only KSM.
+func CapacityNodeFsSQL(env string, from, to time.Time) string {
+	return fmt.Sprintf(`
+SELECT
+  node,
+  k8s_cluster_name,
+  if(usage_root > 0, usage_root, usage_any) AS usage_bytes,
+  if(limit_root > 0, limit_root, limit_any) AS limit_bytes
+FROM (
+  SELECT
+    %s AS node,
+    %s AS k8s_cluster_name,
+    argMaxIf(Value, TimeUnix, MetricName = %s AND coalesce(Attributes['id'], '') = '/') AS usage_root,
+    argMaxIf(Value, TimeUnix, MetricName = %s AND coalesce(Attributes['id'], '') = '/') AS limit_root,
+    argMaxIf(Value, TimeUnix, MetricName = %s) AS usage_any,
+    argMaxIf(Value, TimeUnix, MetricName = %s) AS limit_any
+  FROM %s
+  WHERE MetricName IN (%s, %s)
+    AND %s
+    AND (%s)
+    AND coalesce(Attributes['container'], '') = ''
+  GROUP BY node, k8s_cluster_name
+)
+WHERE node != '' AND (usage_bytes > 0 OR limit_bytes > 0)`,
+		capacityNodeExpr(),
+		capacityClusterExpr(),
+		q(MetricContainerFSUsage), q(MetricContainerFSLimit),
+		q(MetricContainerFSUsage), q(MetricContainerFSLimit),
+		table(queries.CHTableMetricsGauge),
+		q(MetricContainerFSUsage), q(MetricContainerFSLimit),
+		MetricTimeFilter(from, to),
+		capacityEnvFilter(env),
+	)
+}
+
+// CapacityAllocatableSQL returns fleet CPU and memory allocatable sums.
+func CapacityAllocatableSQL(env string, from, to time.Time) string {
+	return fmt.Sprintf(`
+SELECT
+  sumIf(v, resource = 'cpu') AS alloc_cpu,
+  sumIf(v, resource = 'memory') AS alloc_mem
+FROM (
+  SELECT
+    Attributes['resource'] AS resource,
+    coalesce(nullIf(Attributes['node'], ''), nullIf(ResourceAttributes['k8s.node.name'], ''), '') AS node,
+    %s AS k8s_cluster_name,
+    argMax(Value, TimeUnix) AS v
+  FROM %s
+  WHERE MetricName = %s
+    AND %s
+    AND (%s)
+  GROUP BY resource, node, k8s_cluster_name
+)
+LIMIT 1`,
+		capacityClusterExpr(),
+		table(queries.CHTableMetricsGauge),
+		q(MetricKubeNodeAllocatable),
+		MetricTimeFilter(from, to),
+		capacityEnvFilter(env),
+	)
+}
+
+// CapacityPodOwnerSQL returns latest kube_pod_owner rows.
+func CapacityPodOwnerSQL(namespace, env string, from, to time.Time) string {
+	return fmt.Sprintf(`
+SELECT
+  %s AS namespace,
+  %s AS pod,
+  Attributes['owner_kind'] AS owner_kind,
+  Attributes['owner_name'] AS owner_name,
+  %s AS k8s_cluster_name,
+  argMax(Value, TimeUnix) AS value
+FROM %s
+WHERE MetricName = %s
+  AND %s
+  AND (%s)
+  AND (%s)
+GROUP BY namespace, pod, owner_kind, owner_name, k8s_cluster_name
+LIMIT 10000`,
+		capacityNamespaceExpr(),
+		capacityPodExpr(),
+		capacityClusterExpr(),
+		table(queries.CHTableMetricsGauge),
+		q(MetricKubePodOwner),
+		MetricTimeFilter(from, to),
+		capacityNamespaceFilter(namespace),
+		capacityEnvFilter(env),
+	)
+}
+
+// CapacityRecsBucketSQL approximates Path A quantile_over_time(rate) via 5m buckets.
+// Documented as approximation in docs/api/capacity.md.
+func CapacityRecsBucketSQL(namespace, env string, from, to time.Time) string {
+	tf := MetricTimeFilter(from, to)
+	nsF := capacityNamespaceFilter(namespace)
+	envF := capacityEnvFilter(env)
+	ctrX := capacityContainerExclude()
+	nsE := capacityNamespaceExpr()
+	podE := capacityPodExpr()
+	ctrE := capacityContainerExpr()
+	clE := capacityClusterExpr()
+	bucket := CapacityUsageLookbackSec
+
+	return fmt.Sprintf(`
+SELECT
+  namespace,
+  pod,
+  container,
+  k8s_cluster_name,
+  quantileExactInclusive(0.50)(cpu_rate) AS cpu_p50,
+  quantileExactInclusive(0.90)(cpu_rate) AS cpu_p90,
+  quantileExactInclusive(0.95)(cpu_rate) AS cpu_p95,
+  max(cpu_rate) AS cpu_max,
+  quantileExactInclusive(0.50)(mem_val) AS mem_p50,
+  quantileExactInclusive(0.90)(mem_val) AS mem_p90,
+  quantileExactInclusive(0.95)(mem_val) AS mem_p95,
+  max(mem_max) AS mem_max,
+  max(thr_rate) AS thr_rate,
+  argMaxIf(req_cpu, bucket, has_req_cpu) AS req_cpu,
+  argMaxIf(req_mem, bucket, has_req_mem) AS req_mem,
+  argMaxIf(lim_cpu, bucket, has_lim_cpu) AS lim_cpu,
+  argMaxIf(lim_mem, bucket, has_lim_mem) AS lim_mem
+FROM (
+  SELECT
+    namespace,
+    pod,
+    container,
+    k8s_cluster_name,
+    bucket,
+    %s AS cpu_rate,
+    argMaxIf(Value, TimeUnix, MetricName = %s) AS mem_val,
+    maxIf(Value, MetricName = %s) AS mem_max,
+    %s AS thr_rate,
+    argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS req_cpu,
+    argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'memory') AS req_mem,
+    argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'cpu') AS lim_cpu,
+    argMaxIf(Value, TimeUnix, MetricName = %s AND Attributes['resource'] = 'memory') AS lim_mem,
+    countIf(MetricName = %s AND Attributes['resource'] = 'cpu') > 0 AS has_req_cpu,
+    countIf(MetricName = %s AND Attributes['resource'] = 'memory') > 0 AS has_req_mem,
+    countIf(MetricName = %s AND Attributes['resource'] = 'cpu') > 0 AS has_lim_cpu,
+    countIf(MetricName = %s AND Attributes['resource'] = 'memory') > 0 AS has_lim_mem
+  FROM (
+    SELECT
+      namespace,
+      pod,
+      container,
+      k8s_cluster_name,
+      bucket,
+      MetricName,
+      TimeUnix,
+      Value,
+      Attributes,
+      %s,
+      %s,
+      %s
+    FROM (
+      SELECT
+        %s AS namespace,
+        %s AS pod,
+        %s AS container,
+        %s AS k8s_cluster_name,
+        toStartOfInterval(TimeUnix, INTERVAL %d SECOND) AS bucket,
+        MetricName,
+        TimeUnix,
+        Value,
+        Attributes
+      FROM %s
+      WHERE MetricName IN (%s, %s)
+        AND %s AND (%s) AND (%s) AND (%s)
+      UNION ALL
+      SELECT
+        %s AS namespace,
+        %s AS pod,
+        %s AS container,
+        %s AS k8s_cluster_name,
+        toStartOfInterval(TimeUnix, INTERVAL %d SECOND) AS bucket,
+        MetricName,
+        TimeUnix,
+        Value,
+        Attributes
+      FROM %s
+      WHERE MetricName IN (%s, %s, %s)
+        AND %s AND (%s) AND (%s) AND (%s)
+    )
+  )
+  GROUP BY namespace, pod, container, k8s_cluster_name, bucket
+  HAVING container != '' AND container != 'POD'
+)
+GROUP BY namespace, pod, container, k8s_cluster_name
+LIMIT 5000`,
+		capacityCounterRateSQL(q(MetricContainerCPUUsage), bucket),
+		q(MetricContainerMemoryWorkingSet),
+		q(MetricContainerMemoryWorkingSet),
+		capacityCounterRateSQL(q(MetricContainerCPUThrottled), bucket),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceLimits),
+		q(MetricKubePodResourceLimits),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceLimits),
+		q(MetricKubePodResourceLimits),
+		capacityCounterLagSQL(),
+		capacityCounterIncSQL(),
+		capacityCounterDtSQL(),
+		nsE, podE, ctrE, clE, bucket,
+		table(queries.CHTableMetricsSum),
+		q(MetricContainerCPUUsage), q(MetricContainerCPUThrottled),
+		tf, nsF, envF, ctrX,
+		nsE, podE, ctrE, clE, bucket,
+		table(queries.CHTableMetricsGauge),
+		q(MetricContainerMemoryWorkingSet), q(MetricKubePodResourceRequests), q(MetricKubePodResourceLimits),
+		tf, nsF, envF, ctrX,
+	)
+}
+
+// CapacityHistorySeriesSQL returns bucketed fleet aggregates for one namespace.
+// Optional workload scopes pods (prefix/exact match). Cluster is kept in the
+// inner GROUP BY so multi-cluster series stay independent until the outer sum.
+// The scan starts one step before `from` so each first in-range sample has the
+// preceding sample needed to rate a counter. That preceding row is lag input
+// only and contributes no increase of its own.
+func CapacityHistorySeriesSQL(namespace, container, env, workload string, from, to time.Time, stepSec int) string {
+	if stepSec < 15 {
+		stepSec = 15
+	}
+	wl := workload
+	tf := MetricTimeFilter(from.Add(-time.Duration(stepSec)*time.Second), to)
+	nsF := capacityNamespaceFilter(namespace)
+	envF := capacityEnvFilter(env)
+	wlF := capacityPodWorkloadFilter(wl)
+	ctrF := "1"
+	if container != "" {
+		ctrF = fmt.Sprintf("(%s = %s)", capacityContainerExpr(), q(container))
+	}
+	ctrX := capacityContainerExclude()
+	nsE := capacityNamespaceExpr()
+	podE := capacityPodExpr()
+	ctrE := capacityContainerExpr()
+	clE := capacityClusterExpr()
+	inRange := fmt.Sprintf("%s >= fromUnixTimestamp64Milli(%d)", ColTimeUnix, from.UnixMilli())
+
+	return fmt.Sprintf(`
+SELECT
+  bucket_ms,
+  %s AS cpu_usage,
+  sumIf(latest, MetricName = %s AND resource = 'cpu') AS cpu_request,
+  sumIf(latest, MetricName = %s AND resource = 'cpu') AS cpu_limit,
+  sumIf(latest, MetricName = %s) AS mem_usage,
+  sumIf(latest, MetricName = %s AND resource = 'memory') AS mem_request,
+  sumIf(latest, MetricName = %s AND resource = 'memory') AS mem_limit,
+  %s AS cpu_throttled,
+  greatest(sumIf(inc, MetricName = %s), 0) AS restarts
+FROM (
+  SELECT
+    bucket_ms,
+    MetricName,
+    resource,
+    namespace,
+    pod,
+    container,
+    k8s_cluster_name,
+    sumIf(inc, in_range = 1) AS inc,
+    sumIf(dt, in_range = 1) AS dt,
+    argMax(Value, TimeUnix) AS latest
+  FROM (
+    SELECT
+      toUnixTimestamp(toStartOfInterval(TimeUnix, INTERVAL %d SECOND)) * 1000 AS bucket_ms,
+      coalesce(nullIf(Attributes['resource'], ''), '') AS resource,
+      namespace,
+      pod,
+      container,
+      k8s_cluster_name,
+      MetricName,
+      TimeUnix,
+      Value,
+      %s,
+      %s,
+      %s,
+      if(%s, 1, 0) AS in_range
+    FROM (
+      SELECT
+        %s AS namespace,
+        %s AS pod,
+        %s AS container,
+        %s AS k8s_cluster_name,
+        TimeUnix,
+        MetricName,
+        Value,
+        Attributes
+      FROM %s
+      WHERE MetricName IN (%s, %s, %s)
+        AND %s AND (%s) AND (%s) AND (%s) AND (%s) AND (%s)
+      UNION ALL
+      SELECT
+        %s AS namespace,
+        %s AS pod,
+        %s AS container,
+        %s AS k8s_cluster_name,
+        TimeUnix,
+        MetricName,
+        Value,
+        Attributes
+      FROM %s
+      WHERE MetricName IN (%s, %s, %s)
+        AND %s AND (%s) AND (%s) AND (%s) AND (%s) AND (%s)
+    )
+  )
+  GROUP BY bucket_ms, MetricName, resource, namespace, pod, container, k8s_cluster_name
+  HAVING container != '' AND container != 'POD' AND sum(in_range) > 0
+)
+GROUP BY bucket_ms
+ORDER BY bucket_ms
+LIMIT 5000`,
+		capacityCounterRateSumSQL(q(MetricContainerCPUUsage), stepSec),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceLimits),
+		q(MetricContainerMemoryWorkingSet),
+		q(MetricKubePodResourceRequests),
+		q(MetricKubePodResourceLimits),
+		capacityCounterRateSumSQL(q(MetricContainerCPUThrottled), stepSec),
+		q(MetricKubePodRestarts),
+		stepSec,
+		capacityCounterLagSQL(),
+		capacityCounterIncSQL(),
+		capacityCounterDtSQL(),
+		inRange,
+		nsE, podE, ctrE, clE,
+		table(queries.CHTableMetricsSum),
+		q(MetricContainerCPUUsage), q(MetricContainerCPUThrottled), q(MetricKubePodRestarts),
+		tf, nsF, envF, ctrF, ctrX, wlF,
+		nsE, podE, ctrE, clE,
+		table(queries.CHTableMetricsGauge),
+		q(MetricContainerMemoryWorkingSet), q(MetricKubePodResourceRequests), q(MetricKubePodResourceLimits),
+		tf, nsF, envF, ctrF, ctrX, wlF,
+	)
+}
+
+// Note: restarts counter is queried from otel_metrics_sum (same as CPU counters).
+
+// ParseCapacityProbeCount reads probe SQL `c` column.
+func ParseCapacityProbeCount(rows []map[string]any) float64 {
+	if len(rows) == 0 {
+		return 0
+	}
+	return ParseFloat(rows[0]["c"])
+}
+
+// ParseCapacityLedgerRows maps ledger SQL rows to identity structs.
+func ParseCapacityLedgerRows(rows []map[string]any) []CapacityContainerIdentity {
+	out := make([]CapacityContainerIdentity, 0, len(rows))
+	for _, r := range rows {
+		ctr := ParseString(r["container"])
+		if ctr == "" || ctr == "POD" {
+			continue
+		}
+		ns := ParseString(r["namespace"])
+		if ns == "" {
+			continue
+		}
+		out = append(out, CapacityContainerIdentity{
+			Namespace:   ns,
+			Pod:         ParseString(r["pod"]),
+			Container:   ctr,
+			Cluster:     ParseString(r["k8s_cluster_name"]),
+			Node:        ParseString(r["node"]),
+			UsageCPU:    ParseFloat(r["usage_cpu"]),
+			UsageMem:    ParseFloat(r["usage_mem"]),
+			ReqCPU:      ParseFloat(r["req_cpu"]),
+			ReqMem:      ParseFloat(r["req_mem"]),
+			LimCPU:      ParseFloat(r["lim_cpu"]),
+			LimMem:      ParseFloat(r["lim_mem"]),
+			Throttled:   ParseFloat(r["thr_rate"]),
+			HasUsageCPU: ParseFloat(r["has_usage_cpu"]) > 0,
+			HasUsageMem: ParseFloat(r["has_usage_mem"]) > 0,
+			HasReqCPU:   ParseFloat(r["has_req_cpu"]) > 0,
+			HasReqMem:   ParseFloat(r["has_req_mem"]) > 0,
+			HasLimCPU:   ParseFloat(r["has_lim_cpu"]) > 0,
+			HasLimMem:   ParseFloat(r["has_lim_mem"]) > 0,
+			HasThrottle: ParseFloat(r["has_throttle"]) > 0,
+		})
+	}
+	return out
+}
+
+func promVal(v float64) queries.PromValue {
+	return queries.NewPromValue(0, strconv.FormatFloat(v, 'f', -1, 64))
+}
+
+func promMetric(labels map[string]string, v float64) queries.PromResult {
+	m := make(map[string]string, len(labels))
+	for k, val := range labels {
+		if val != "" {
+			m[k] = val
+		}
+	}
+	return queries.PromResult{Metric: m, Value: promVal(v)}
+}
+
+type capacityNsAgg struct {
+	nsName             string
+	wasteCPU, wasteMem float64
+	usageCPU, usageMem float64
+	reqCPU, reqMem     float64
+	cluster            string
+}
+
+type capacityWasteRow struct {
+	ns, pod, ctr, cluster string
+	waste                 float64
+}
+
+func emptyCapacityResultMap() map[string][]queries.PromResult {
+	return map[string][]queries.PromResult{
+		"wasteCpuNs": {}, "wasteMemNs": {}, "wasteCpuTop": {}, "wasteMemTop": {},
+		"sumCpuUsage": {}, "sumMemUsage": {}, "sumCpuReq": {}, "sumMemReq": {},
+		"allocCpu": {}, "allocMem": {},
+		"nsCpuUsage": {}, "nsMemUsage": {}, "nsCpuReq": {}, "nsMemReq": {},
+		"nodeCpuUsage": {}, "nodeMemUsage": {}, "nodeCpuAlloc": {}, "nodeMemAlloc": {},
+		"nodeFsUsage": {}, "nodeFsLimit": {},
+		"gapMissingReqCpu": {}, "gapMissingReqMem": {},
+		"gapMissingLimCpu": {}, "gapMissingLimMem": {},
+		"gapReservedCpu": {}, "gapReservedMem": {},
+		"underCpu": {}, "underMem": {}, "throttled": {},
+		"overReqCpu": {}, "overReqMem": {},
+	}
+}
+
+func accumulateCapacityRow(
+	r CapacityContainerIdentity,
+	ns *capacityNsAgg,
+	rm map[string][]queries.PromResult,
+	topCPU, topMem *[]capacityWasteRow,
+) (sumCPUUsage, sumMemUsage, sumCPUReq, sumMemReq float64) {
+	labels := map[string]string{
+		"namespace": r.Namespace, "pod": r.Pod, "container": r.Container, "k8s_cluster_name": r.Cluster,
+	}
+	sumCPUUsage = r.UsageCPU
+	sumMemUsage = r.UsageMem
+	ns.usageCPU += r.UsageCPU
+	ns.usageMem += r.UsageMem
+	if r.HasReqCPU {
+		sumCPUReq = r.ReqCPU
+		ns.reqCPU += r.ReqCPU
+	}
+	if r.HasReqMem {
+		sumMemReq = r.ReqMem
+		ns.reqMem += r.ReqMem
+	}
+	hasUsage := r.HasUsageCPU || r.HasUsageMem || r.UsageCPU > 0 || r.UsageMem > 0
+	if r.HasReqCPU {
+		w := math.Max(r.ReqCPU-r.UsageCPU, 0)
+		ns.wasteCPU += w
+		if w > 0 {
+			*topCPU = append(*topCPU, capacityWasteRow{r.Namespace, r.Pod, r.Container, r.Cluster, w})
+		}
+	}
+	if r.HasReqMem {
+		w := math.Max(r.ReqMem-r.UsageMem, 0)
+		ns.wasteMem += w
+		if w > 0 {
+			*topMem = append(*topMem, capacityWasteRow{r.Namespace, r.Pod, r.Container, r.Cluster, w})
+		}
+	}
+	if hasUsage && !r.HasReqCPU {
+		rm["gapMissingReqCpu"] = append(rm["gapMissingReqCpu"], promMetric(labels, 1))
+	}
+	if hasUsage && !r.HasReqMem {
+		rm["gapMissingReqMem"] = append(rm["gapMissingReqMem"], promMetric(labels, 1))
+	}
+	if hasUsage && !r.HasLimCPU {
+		rm["gapMissingLimCpu"] = append(rm["gapMissingLimCpu"], promMetric(labels, 1))
+	}
+	if hasUsage && !r.HasLimMem {
+		rm["gapMissingLimMem"] = append(rm["gapMissingLimMem"], promMetric(labels, 1))
+	}
+	if r.HasReqCPU && !r.HasUsageCPU && r.UsageCPU == 0 {
+		rm["gapReservedCpu"] = append(rm["gapReservedCpu"], promMetric(labels, 1))
+	}
+	if r.HasReqMem && !r.HasUsageMem && r.UsageMem == 0 {
+		rm["gapReservedMem"] = append(rm["gapReservedMem"], promMetric(labels, 1))
+	}
+	if r.HasReqCPU && r.UsageCPU > r.ReqCPU {
+		rm["underCpu"] = append(rm["underCpu"], promMetric(labels, r.UsageCPU-r.ReqCPU))
+	}
+	if r.HasReqMem && r.UsageMem > r.ReqMem {
+		rm["underMem"] = append(rm["underMem"], promMetric(labels, r.UsageMem-r.ReqMem))
+	}
+	if r.HasThrottle && r.Throttled > 0 {
+		rm["throttled"] = append(rm["throttled"], promMetric(labels, r.Throttled))
+	}
+	return sumCPUUsage, sumMemUsage, sumCPUReq, sumMemReq
+}
+
+func emitCapacityNamespaceGaps(rm map[string][]queries.PromResult, nsMap map[string]*capacityNsAgg) {
+	for _, a := range nsMap {
+		nsName := a.nsName
+		labels := map[string]string{"namespace": nsName, "k8s_cluster_name": a.cluster}
+		appendIfPos := func(key string, v float64) {
+			if v > 0 {
+				rm[key] = append(rm[key], promMetric(labels, v))
+			}
+		}
+		appendIfPos("wasteCpuNs", a.wasteCPU)
+		appendIfPos("wasteMemNs", a.wasteMem)
+		appendIfPos("nsCpuUsage", a.usageCPU)
+		appendIfPos("nsMemUsage", a.usageMem)
+		appendIfPos("nsCpuReq", a.reqCPU)
+		appendIfPos("nsMemReq", a.reqMem)
+	}
+}
+
+func emitCapacityTopWaste(rm map[string][]queries.PromResult, topCPU, topMem []capacityWasteRow) {
+	sort.Slice(topCPU, func(i, j int) bool { return topCPU[i].waste > topCPU[j].waste })
+	sort.Slice(topMem, func(i, j int) bool { return topMem[i].waste > topMem[j].waste })
+	// Full-population counts before truncating display lists.
+	rm["overReqCpu"] = []queries.PromResult{promMetric(nil, float64(len(topCPU)))}
+	rm["overReqMem"] = []queries.PromResult{promMetric(nil, float64(len(topMem)))}
+	const topN = 50
+	if len(topCPU) > topN {
+		topCPU = topCPU[:topN]
+	}
+	if len(topMem) > topN {
+		topMem = topMem[:topN]
+	}
+	for _, w := range topCPU {
+		rm["wasteCpuTop"] = append(rm["wasteCpuTop"], promMetric(map[string]string{
+			"namespace": w.ns, "pod": w.pod, "container": w.ctr, "k8s_cluster_name": w.cluster,
+		}, w.waste))
+	}
+	for _, w := range topMem {
+		rm["wasteMemTop"] = append(rm["wasteMemTop"], promMetric(map[string]string{
+			"namespace": w.ns, "pod": w.pod, "container": w.ctr, "k8s_cluster_name": w.cluster,
+		}, w.waste))
+	}
+}
+
+// CapacityLedgerToResultMap builds the PromResult job map aggregateCapacity expects.
+func CapacityLedgerToResultMap(rows []CapacityContainerIdentity, allocCPU, allocMem float64) map[string][]queries.PromResult {
+	rm := emptyCapacityResultMap()
+	nsMap := map[string]*capacityNsAgg{}
+	var sumCPUUsage, sumMemUsage, sumCPUReq, sumMemReq float64
+	var topCPU, topMem []capacityWasteRow
+
+	type nodeAgg struct {
+		cluster  string
+		cpu, mem float64
+	}
+	nodeUsage := map[string]*nodeAgg{}
+
+	for _, r := range rows {
+		key := r.Namespace
+		if r.Cluster != "" {
+			key = r.Cluster + "\x00" + r.Namespace
+		}
+		ns := nsMap[key]
+		if ns == nil {
+			ns = &capacityNsAgg{nsName: r.Namespace, cluster: r.Cluster}
+			nsMap[key] = ns
+		}
+		if r.Cluster != "" {
+			ns.cluster = r.Cluster
+		}
+		uCPU, uMem, rCPU, rMem := accumulateCapacityRow(r, ns, rm, &topCPU, &topMem)
+		sumCPUUsage += uCPU
+		sumMemUsage += uMem
+		sumCPUReq += rCPU
+		sumMemReq += rMem
+		if r.Node != "" {
+			nk := r.Node
+			if r.Cluster != "" {
+				nk = r.Cluster + "\x00" + r.Node
+			}
+			na := nodeUsage[nk]
+			if na == nil {
+				na = &nodeAgg{cluster: r.Cluster}
+				nodeUsage[nk] = na
+			}
+			na.cpu += r.UsageCPU
+			na.mem += r.UsageMem
+		}
+	}
+
+	emitCapacityNamespaceGaps(rm, nsMap)
+	emitCapacityTopWaste(rm, topCPU, topMem)
+
+	for nk, na := range nodeUsage {
+		node := nk
+		if i := strings.LastIndex(nk, "\x00"); i >= 0 {
+			node = nk[i+1:]
+		}
+		labels := map[string]string{"node": node}
+		if na.cluster != "" {
+			labels["k8s_cluster_name"] = na.cluster
+		}
+		if na.cpu > 0 {
+			rm["nodeCpuUsage"] = append(rm["nodeCpuUsage"], promMetric(labels, na.cpu))
+		}
+		if na.mem > 0 {
+			rm["nodeMemUsage"] = append(rm["nodeMemUsage"], promMetric(labels, na.mem))
+		}
+	}
+
+	rm["sumCpuUsage"] = []queries.PromResult{promMetric(nil, sumCPUUsage)}
+	rm["sumMemUsage"] = []queries.PromResult{promMetric(nil, sumMemUsage)}
+	rm["sumCpuReq"] = []queries.PromResult{promMetric(nil, sumCPUReq)}
+	rm["sumMemReq"] = []queries.PromResult{promMetric(nil, sumMemReq)}
+	if allocCPU > 0 {
+		rm["allocCpu"] = []queries.PromResult{promMetric(nil, allocCPU)}
+	}
+	if allocMem > 0 {
+		rm["allocMem"] = []queries.PromResult{promMetric(nil, allocMem)}
+	}
+	return rm
+}
+
+// MergeNodeAllocIntoResultMap adds per-node allocatable series from CapacityNodeAllocSQL rows.
+func MergeNodeAllocIntoResultMap(rm map[string][]queries.PromResult, rows []map[string]any) {
+	if rm == nil {
+		return
+	}
+	for _, r := range rows {
+		node := ParseString(r["node"])
+		if node == "" {
+			continue
+		}
+		labels := map[string]string{"node": node}
+		if cluster := ParseString(r["k8s_cluster_name"]); cluster != "" {
+			labels["k8s_cluster_name"] = cluster
+		}
+		if cpu := ParseFloat(r["alloc_cpu"]); cpu > 0 {
+			rm["nodeCpuAlloc"] = append(rm["nodeCpuAlloc"], promMetric(labels, cpu))
+		}
+		if mem := ParseFloat(r["alloc_mem"]); mem > 0 {
+			rm["nodeMemAlloc"] = append(rm["nodeMemAlloc"], promMetric(labels, mem))
+		}
+	}
+}
+
+// MergeNodeFsIntoResultMap adds per-node filesystem usage/limit from CapacityNodeFsSQL rows.
+func MergeNodeFsIntoResultMap(rm map[string][]queries.PromResult, rows []map[string]any) {
+	if rm == nil {
+		return
+	}
+	for _, r := range rows {
+		node := ParseString(r["node"])
+		if node == "" {
+			continue
+		}
+		labels := map[string]string{"node": node}
+		if cluster := ParseString(r["k8s_cluster_name"]); cluster != "" {
+			labels["k8s_cluster_name"] = cluster
+		}
+		if usage := ParseFloat(r["usage_bytes"]); usage > 0 {
+			rm["nodeFsUsage"] = append(rm["nodeFsUsage"], promMetric(labels, usage))
+		}
+		if limit := ParseFloat(r["limit_bytes"]); limit > 0 {
+			rm["nodeFsLimit"] = append(rm["nodeFsLimit"], promMetric(labels, limit))
+		}
+	}
+}
+
+// ParseCapacityAllocatable reads alloc_cpu / alloc_mem from CapacityAllocatableSQL.
+func ParseCapacityAllocatable(rows []map[string]any) (cpu, mem float64) {
+	if len(rows) == 0 {
+		return 0, 0
+	}
+	return ParseFloat(rows[0]["alloc_cpu"]), ParseFloat(rows[0]["alloc_mem"])
+}
+
+// CapacityRecRow is one recommendations bucket aggregate.
+type CapacityRecRow struct {
+	Namespace string
+	Pod       string
+	Container string
+	Cluster   string
+	CPUP50    float64
+	CPUP90    float64
+	CPUP95    float64
+	CPUMax    float64
+	MemP50    float64
+	MemP90    float64
+	MemP95    float64
+	MemMax    float64
+	Throttled float64
+	ReqCPU    float64
+	ReqMem    float64
+	LimCPU    float64
+	LimMem    float64
+}
+
+// ParseCapacityRecRows maps CapacityRecsBucketSQL output.
+func ParseCapacityRecRows(rows []map[string]any) []CapacityRecRow {
+	out := make([]CapacityRecRow, 0, len(rows))
+	for _, r := range rows {
+		ctr := ParseString(r["container"])
+		ns := ParseString(r["namespace"])
+		if ns == "" || ctr == "" || ctr == "POD" {
+			continue
+		}
+		out = append(out, CapacityRecRow{
+			Namespace: ns,
+			Pod:       ParseString(r["pod"]),
+			Container: ctr,
+			Cluster:   ParseString(r["k8s_cluster_name"]),
+			CPUP50:    ParseFloat(r["cpu_p50"]),
+			CPUP90:    ParseFloat(r["cpu_p90"]),
+			CPUP95:    ParseFloat(r["cpu_p95"]),
+			CPUMax:    ParseFloat(r["cpu_max"]),
+			MemP50:    ParseFloat(r["mem_p50"]),
+			MemP90:    ParseFloat(r["mem_p90"]),
+			MemP95:    ParseFloat(r["mem_p95"]),
+			MemMax:    ParseFloat(r["mem_max"]),
+			Throttled: ParseFloat(r["thr_rate"]),
+			ReqCPU:    ParseFloat(r["req_cpu"]),
+			ReqMem:    ParseFloat(r["req_mem"]),
+			LimCPU:    ParseFloat(r["lim_cpu"]),
+			LimMem:    ParseFloat(r["lim_mem"]),
+		})
+	}
+	return out
+}
+
+// CapacityOwner is a kube_pod_owner row.
+type CapacityOwner struct {
+	Namespace string
+	Pod       string
+	Kind      string
+	Name      string
+	Cluster   string
+}
+
+// ParseCapacityOwners maps CapacityPodOwnerSQL.
+func ParseCapacityOwners(rows []map[string]any) []CapacityOwner {
+	out := make([]CapacityOwner, 0, len(rows))
+	for _, r := range rows {
+		pod := ParseString(r["pod"])
+		if pod == "" {
+			continue
+		}
+		out = append(out, CapacityOwner{
+			Namespace: ParseString(r["namespace"]),
+			Pod:       pod,
+			Kind:      ParseString(r["owner_kind"]),
+			Name:      ParseString(r["owner_name"]),
+			Cluster:   ParseString(r["k8s_cluster_name"]),
+		})
+	}
+	return out
+}
+
+// CapacityHistoryPointRow is one bucket from CapacityHistorySeriesSQL.
+type CapacityHistoryPointRow struct {
+	BucketMs     int64
+	CPUUsage     float64
+	CPURequest   float64
+	CPULimit     float64
+	MemUsage     float64
+	MemRequest   float64
+	MemLimit     float64
+	CPUThrottled float64
+	Restarts     float64
+}
+
+// ParseCapacityHistoryRows maps history SQL.
+func ParseCapacityHistoryRows(rows []map[string]any) []CapacityHistoryPointRow {
+	out := make([]CapacityHistoryPointRow, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, CapacityHistoryPointRow{
+			BucketMs:     int64(ParseFloat(r["bucket_ms"])),
+			CPUUsage:     ParseFloat(r["cpu_usage"]),
+			CPURequest:   ParseFloat(r["cpu_request"]),
+			CPULimit:     ParseFloat(r["cpu_limit"]),
+			MemUsage:     ParseFloat(r["mem_usage"]),
+			MemRequest:   ParseFloat(r["mem_request"]),
+			MemLimit:     ParseFloat(r["mem_limit"]),
+			CPUThrottled: ParseFloat(r["cpu_throttled"]),
+			Restarts:     ParseFloat(r["restarts"]),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].BucketMs < out[j].BucketMs })
+	return out
+}
+
+// LinearForecast projects usage forward 7d from points. Returns end prediction and slope/sec.
+func LinearForecast(points []struct {
+	T int64
+	V float64
+}, horizonSec float64) (pred, slopePerSec float64, ok bool) {
+	n := len(points)
+	if n < 2 {
+		return 0, 0, false
+	}
+	var sumT, sumV, sumTT, sumTV float64
+	for _, p := range points {
+		t := float64(p.T) / 1000 // seconds
+		sumT += t
+		sumV += p.V
+		sumTT += t * t
+		sumTV += t * p.V
+	}
+	nf := float64(n)
+	den := nf*sumTT - sumT*sumT
+	if den == 0 {
+		return 0, 0, false
+	}
+	slope := (nf*sumTV - sumT*sumV) / den
+	intercept := (sumV - slope*sumT) / nf
+	tLast := float64(points[n-1].T) / 1000
+	pred = intercept + slope*(tLast+horizonSec)
+	return pred, slope, true
+}
+
+// CapacityProbeForbidsProcess reports whether SQL avoids process_* (forbidden usage substitute).
+func CapacityProbeForbidsProcess(sql string) bool {
+	return !strings.Contains(sql, "process_")
+}

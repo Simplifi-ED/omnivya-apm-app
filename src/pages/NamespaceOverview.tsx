@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { PluginPage } from '@grafana/runtime';
 import { IconButton, MultiCombobox, useStyles2 } from '@grafana/ui';
@@ -37,6 +37,7 @@ import { NamespaceServicesTable } from './namespace/NamespaceServicesTable';
 import { NamespaceDependencies } from './namespace/NamespaceDependencies';
 import { NamespaceAlerts } from './namespace/NamespaceAlerts';
 import { NamespaceScorecardRollup } from './namespace/NamespaceScorecardRollup';
+import { NamespaceCapacityBlock } from './namespace/NamespaceCapacityBlock';
 import { getNamespaceScorecard, NamespaceScorecardResponse } from '../api/scorecard';
 import { getNamespaceOwnership, NamespaceOwnershipResponse } from '../api/ownership';
 
@@ -139,13 +140,17 @@ function NamespaceOverview() {
 
   const teamFilters = useMemo(() => searchParams.getAll('team').filter(Boolean), [searchParams]);
 
+  const [capacityRefreshKey, setCapacityRefreshKey] = useState(0);
+
   // Auto-refresh. For relative ranges (now-1h), re-resolving the range updates
   // fromMs/toMs and every time-scoped useFetch above refetches via its deps.
   // Alerts have no time-range dependency, so they are refetched explicitly.
+  // Absolute ranges also bump capacityRefreshKey so NamespaceCapacityBlock refetches.
   const handleRefresh = useCallback(() => {
     refetchAlerts();
     if (isRelativeRange) {
       refreshTimeRange();
+      setCapacityRefreshKey((n) => n + 1);
       return;
     }
     refetchServices();
@@ -155,6 +160,7 @@ function NamespaceOverview() {
     refetchIssuesAttention();
     refetchNsScorecard();
     refetchNsOwnership();
+    setCapacityRefreshKey((n) => n + 1);
   }, [
     isRelativeRange,
     refreshTimeRange,
@@ -351,6 +357,14 @@ function NamespaceOverview() {
               const env = environment || (envFilters.length === 1 ? envFilters[0] : undefined);
               handleServiceClick(decodedNs, svc, env);
             }}
+          />
+
+          <NamespaceCapacityBlock
+            namespace={decodedNs}
+            environment={envFilters.length === 1 ? envFilters[0] : envFilters.join(',') || undefined}
+            fromMs={fromMs}
+            toMs={toMs}
+            refreshKey={capacityRefreshKey}
           />
 
           {!nsOwnershipLoading && nsOwnership && nsOwnership.total > 0 && (
